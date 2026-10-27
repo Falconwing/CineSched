@@ -81,13 +81,14 @@ The Rust application uses egui and targets both Windows and macOS.
 
 Remaining parity and feature areas:
 
-- [ ] Drag-and-drop scene scheduling and multi-select editing
-- [ ] Localized English and Spanish UI
+- [x] Drag-and-drop scene scheduling
+- [ ] Complete English and Spanish localization across UI, reports, and messages
 - [ ] Advanced call-sheet weather and sun-time details
-- [ ] Full vector PDF styling and page layout parity
+- [ ] Full vector PDF styling parity
 - [ ] Multi-select scenes for batch editing
-- [ ] Recent-project management and autosave
-- [ ] Complete undo/redo coverage
+- [x] Recent-project management
+- [x] Autosave and recovery
+- [x] Project-wide undo/redo for edited project data
 - [ ] iCloud sync and CSV / Excel export
 
 ## License

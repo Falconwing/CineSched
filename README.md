@@ -6,9 +6,11 @@ A native Rust desktop application is being developed with egui to support
 Windows and macOS. The current Rust application includes a monthly calendar,
 scene and breakdown editing, a stripboard, cast and crew setup, call sheets,
 schedule conflict and lock reports, script import, project persistence,
-appearance preferences, undo/redo for primary schedule actions, and PDF
-exports. The SwiftUI implementation remains in the repository as the feature
-reference until platform behavior and export parity have been reviewed.
+appearance preferences, autosave and recovery, drag-and-drop scheduling,
+project-wide undo/redo, selectable English/Spanish interface labels, and
+paginated PDF exports. The SwiftUI implementation remains in the repository as
+the feature reference until platform behavior and export parity have been
+reviewed.
 
 ### Build and test the Rust application
 
@@ -27,13 +29,14 @@ JSON fields that are not yet represented in the Rust interface are preserved
 when opening and saving a project.
 
 The port is not yet a complete replacement for the mature macOS application.
-Remaining parity work includes drag-and-drop scene rescheduling, full calendar
-event/notice and automatic meal workflows,
-call-sheet automatic weather lookup and deeper production-roster integration,
-high-fidelity vector PDF layouts and pagination, import-review and parser edge cases,
-localized English/Spanish UI, per-scene color customization, recent-project
-management, autosave, and complete undo/redo coverage. Verify differences
+Remaining parity work includes call-sheet automatic weather lookup, additional
+calendar event and automatic meal workflows, high-fidelity vector PDF styling,
+translation of all report content and validation messages, import-review and
+parser edge cases, and per-scene color customization. Verify differences
 against the Swift reference before removing any Swift source.
+
+The Rust desktop app also persists up to ten recently opened or saved project
+paths and exposes them through **Open Recent**.
 
 A cross-platform desktop scheduler for film shoots. The existing SwiftUI
 application provides visual calendar and stripboard scheduling, scene

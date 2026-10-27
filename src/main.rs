@@ -1,6 +1,8 @@
 //! Native egui desktop entry point for CineSched.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::fs;
+use std::path::PathBuf;
 
 use chrono::{Datelike, Duration, Local, NaiveDate, TimeZone, Utc};
 use eframe::egui;
@@ -8,16 +10,21 @@ use rfd::FileDialog;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use cinesched::localization::{
+    format_long_date, format_month, translate, translate_status, Language,
+};
+
 use cinesched::model::{
     CastCallEntry, CastMember, CrewCallEntry, CrewMember, DateRange, Location, ProductionInfo,
     Project, Scene, ShootDay,
 };
 use cinesched::reports::{
-    export_breakdowns_pdf, export_call_sheet_pdf, export_days_out_of_days_pdf,
-    export_month_calendar_pdf, export_schedule_pdf, export_stripboard_pdf, export_timeline_pdf,
+    export_breakdowns_pdf_localized, export_call_sheet_pdf_localized,
+    export_days_out_of_days_pdf_localized, export_month_calendar_pdf_localized,
+    export_schedule_pdf_localized, export_stripboard_pdf_localized, export_timeline_pdf_localized,
 };
 use cinesched::script_import::import_script;
-use cinesched::{load_project, save_project};
+use cinesched::{load_latest_autosave, load_project, save_autosave, save_project};
 
 /// Starts the cross-platform desktop application.
 fn main() -> eframe::Result<()> {
@@ -30,6 +37,8 @@ fn main() -> eframe::Result<()> {
                 .storage
                 .and_then(|storage| eframe::get_value(storage, eframe::APP_KEY))
                 .unwrap_or_default();
+            let mut app = app;
+            app.initialize_autosave();
             Ok(Box::new(app))
         }),
     )
@@ -40,6 +49,18 @@ fn main() -> eframe::Result<()> {
 struct CineSchedApp {
     project: Project,
     file_path: Option<std::path::PathBuf>,
+    #[serde(default)]
+    recent_projects: Vec<std::path::PathBuf>,
+    #[serde(skip)]
+    autosave_path: Option<PathBuf>,
+    #[serde(skip)]
+    autosave_dirty: bool,
+    #[serde(skip)]
+    autosave_countdown: f32,
+    #[serde(skip)]
+    autosave_recovery_available: bool,
+    #[serde(skip)]
+    history_action_this_frame: bool,
     new_scene_title: String,
     status: String,
     month: NaiveDate,
@@ -77,6 +98,8 @@ struct CineSchedApp {
     dark_mode: bool,
     show_cast: bool,
     show_estimated_time: bool,
+    #[serde(default)]
+    language: Language,
 }
 
 /// Display-only values for a shooting day in the stripboard.
@@ -96,6 +119,12 @@ impl Default for CineSchedApp {
         Self {
             project: Project::default(),
             file_path: None,
+            recent_projects: Vec::new(),
+            autosave_path: None,
+            autosave_dirty: false,
+            autosave_countdown: 0.0,
+            autosave_recovery_available: false,
+            history_action_this_frame: false,
             new_scene_title: String::new(),
             status: String::new(),
             month,
@@ -128,6 +157,7 @@ impl Default for CineSchedApp {
             dark_mode: false,
             show_cast: false,
             show_estimated_time: false,
+            language: Language::default(),
         }
     }
 }
@@ -135,6 +165,8 @@ impl Default for CineSchedApp {
 impl eframe::App for CineSchedApp {
     /// Draws the project controls, unscheduled scenes, and shooting calendar.
     fn update(&mut self, context: &egui::Context, _frame: &mut eframe::Frame) {
+        let project_before_frame = self.project.clone();
+        self.history_action_this_frame = false;
         context.set_visuals(if self.dark_mode {
             egui::Visuals::dark()
         } else {
@@ -142,87 +174,162 @@ impl eframe::App for CineSchedApp {
         });
         egui::TopBottomPanel::top("main_menu").show(context, |ui| {
             ui.horizontal_wrapped(|ui| {
-                if ui.button("New").clicked() {
+                if ui.button(translate(self.language, "New")).clicked() {
                     self.record_undo();
                     self.project = Project::default();
                     self.file_path = None;
-                    self.status = "Created a new project".to_owned();
+                    self.status = translate(self.language, "Created a new project");
                 }
-                if ui.button("Open...").clicked() {
+                if ui.button(translate(self.language, "Open...")).clicked() {
                     self.open_project();
                 }
-                if ui.button("Save").clicked() {
+                ui.menu_button(translate(self.language, "Open Recent"), |ui| {
+                    if self.recent_projects.is_empty() {
+                        ui.label(translate(self.language, "No recent projects"));
+                    } else {
+                        for path in self.recent_projects.clone() {
+                            let label = path
+                                .file_name()
+                                .and_then(|name| name.to_str())
+                                .unwrap_or_else(|| path.to_str().unwrap_or("Project"));
+                            let response = ui.button(label);
+                            if response.on_hover_text(path.display().to_string()).clicked() {
+                                self.open_project_path(path);
+                                ui.close_menu();
+                            }
+                        }
+                        ui.separator();
+                        if ui
+                            .button(translate(self.language, "Clear Recent Projects"))
+                            .clicked()
+                        {
+                            self.recent_projects.clear();
+                            ui.close_menu();
+                        }
+                    }
+                });
+                if ui.button(translate(self.language, "Save")).clicked() {
                     self.save_current_project();
                 }
-                if ui.button("Save As...").clicked() {
+                if ui.button(translate(self.language, "Save As...")).clicked() {
                     self.save_project_as();
                 }
-                if ui.button("Import Script...").clicked() {
+                if ui
+                    .button(translate(self.language, "Import Script..."))
+                    .clicked()
+                {
                     self.import_script_file();
                 }
                 if ui
-                    .button(if self.stripboard {
-                        "Calendar"
-                    } else {
-                        "Stripboard"
-                    })
+                    .button(translate(
+                        self.language,
+                        if self.stripboard {
+                            "Calendar"
+                        } else {
+                            "Stripboard"
+                        },
+                    ))
                     .clicked()
                 {
                     self.stripboard = !self.stripboard;
                 }
-                if ui.button("Production Setup").clicked() {
+                if ui
+                    .button(translate(self.language, "Production Setup"))
+                    .clicked()
+                {
                     self.show_production = true;
                 }
-                ui.checkbox(&mut self.dark_mode, "Dark Mode");
-                ui.checkbox(&mut self.show_cast, "Show Cast");
-                ui.checkbox(&mut self.show_estimated_time, "Show Estimated Time");
-                ui.checkbox(&mut self.include_hold, "Include Holds in DOOD");
-                if ui.button("Scan Conflicts").clicked() {
+                ui.checkbox(&mut self.dark_mode, translate(self.language, "Dark Mode"));
+                ui.checkbox(&mut self.show_cast, translate(self.language, "Show Cast"));
+                ui.checkbox(
+                    &mut self.show_estimated_time,
+                    translate(self.language, "Show Estimated Time"),
+                );
+                ui.checkbox(
+                    &mut self.include_hold,
+                    translate(self.language, "Include Holds in DOOD"),
+                );
+                ui.menu_button(translate(self.language, "Language"), |ui| {
+                    for language in [Language::English, Language::Spanish] {
+                        if ui
+                            .selectable_label(self.language == language, language.display_name())
+                            .clicked()
+                        {
+                            self.language = language;
+                            ui.close_menu();
+                        }
+                    }
+                });
+                if ui
+                    .button(translate(self.language, "Scan Conflicts"))
+                    .clicked()
+                {
                     self.show_conflicts = true;
                 }
-                if ui.button("Check Duplicate Numbers").clicked() {
+                if ui
+                    .button(translate(self.language, "Check Duplicate Numbers"))
+                    .clicked()
+                {
                     let duplicates = self.project.duplicate_scene_number_ids();
-                    self.status = if duplicates.is_empty() {
-                        "No duplicate scene numbers found".to_owned()
+                    self.set_status(if duplicates.is_empty() {
+                        translate(self.language, "No duplicate scene numbers found")
                     } else {
                         format!("{} duplicate scene numbers found", duplicates.len())
-                    };
+                    });
                 }
-                if ui.button("Lock Schedule").clicked() {
+                if ui
+                    .button(translate(self.language, "Lock Schedule"))
+                    .clicked()
+                {
                     self.record_undo();
                     self.project.lock_schedule(Utc::now());
-                    self.status = "Schedule locked".to_owned();
+                    self.status = translate(self.language, "Schedule locked");
                 }
-                if ui.button("Unlock").clicked() {
+                if ui.button(translate(self.language, "Unlock")).clicked() {
                     self.record_undo();
                     self.project.unlock_schedule();
-                    self.status = "Schedule unlocked".to_owned();
+                    self.status = translate(self.language, "Schedule unlocked");
                 }
-                if ui.button("Lock Report").clicked() {
+                if ui.button(translate(self.language, "Lock Report")).clicked() {
                     self.show_lock_report = true;
                 }
-                if ui.button("Undo").clicked() {
+                if ui.button(translate(self.language, "Undo")).clicked() {
                     self.undo();
                 }
-                if ui.button("Redo").clicked() {
+                if ui.button(translate(self.language, "Redo")).clicked() {
                     self.redo();
                 }
-                if ui.button("Export PDF...").clicked() {
+                if ui
+                    .button(translate(self.language, "Export PDF..."))
+                    .clicked()
+                {
                     self.export_schedule();
                 }
-                if ui.button("Breakdowns PDF...").clicked() {
+                if ui
+                    .button(translate(self.language, "Breakdowns PDF..."))
+                    .clicked()
+                {
                     self.export_breakdowns();
                 }
-                if ui.button("DOOD PDF...").clicked() {
+                if ui.button(translate(self.language, "DOOD PDF...")).clicked() {
                     self.export_dood();
                 }
-                if ui.button("Month PDF...").clicked() {
+                if ui
+                    .button(translate(self.language, "Month PDF..."))
+                    .clicked()
+                {
                     self.export_month();
                 }
-                if ui.button("Stripboard PDF...").clicked() {
+                if ui
+                    .button(translate(self.language, "Stripboard PDF..."))
+                    .clicked()
+                {
                     self.export_stripboard();
                 }
-                if ui.button("One-Line PDF...").clicked() {
+                if ui
+                    .button(translate(self.language, "One-Line PDF..."))
+                    .clicked()
+                {
                     self.export_timeline();
                 }
                 ui.separator();
@@ -236,6 +343,20 @@ impl eframe::App for CineSchedApp {
 
         egui::CentralPanel::default().show(context, |ui| {
             ui.heading("CineSched");
+            if self.autosave_recovery_available {
+                ui.horizontal(|ui| {
+                    ui.label(translate(
+                        self.language,
+                        "An autosaved project is available to recover.",
+                    ));
+                    if ui.button(translate(self.language, "Recover")).clicked() {
+                        self.recover_autosave();
+                    }
+                    if ui.button(translate(self.language, "Discard")).clicked() {
+                        self.discard_autosave();
+                    }
+                });
+            }
             ui.label(format!(
                 "{} unscheduled scenes | {} calendar days",
                 self.project.all_scenes.len(),
@@ -244,14 +365,19 @@ impl eframe::App for CineSchedApp {
 
             ui.horizontal(|ui| {
                 ui.text_edit_singleline(&mut self.new_scene_title);
-                if ui.button("Add Scene").clicked() && !self.new_scene_title.trim().is_empty() {
+                if ui.button(translate(self.language, "Add Scene")).clicked()
+                    && !self.new_scene_title.trim().is_empty()
+                {
                     self.record_undo();
                     self.project
                         .all_scenes
                         .push(Scene::new(self.new_scene_title.trim()));
                     self.new_scene_title.clear();
                 }
-                if ui.button("Add 30-Day Calendar").clicked() {
+                if ui
+                    .button(translate(self.language, "Add 30-Day Calendar"))
+                    .clicked()
+                {
                     self.add_calendar();
                 }
             });
@@ -269,6 +395,7 @@ impl eframe::App for CineSchedApp {
         self.draw_conflict_report(context);
         self.draw_schedule_lock_report(context);
         self.draw_scene_editor(context);
+        self.finish_project_frame(project_before_frame, context);
     }
 
     /// Persists project state and appearance preferences across application launches.
@@ -278,6 +405,141 @@ impl eframe::App for CineSchedApp {
 }
 
 impl CineSchedApp {
+    /// Stores a user-facing message after translating its stable text and template.
+    fn set_status(&mut self, message: impl AsRef<str>) {
+        self.status = translate_status(self.language, message.as_ref());
+    }
+
+    /// Locates the app-data autosave and makes a valid previous copy recoverable.
+    fn initialize_autosave(&mut self) {
+        self.autosave_path =
+            eframe::storage_dir("CineSched").map(|directory| directory.join("autosave.json"));
+        let Some(path) = self.autosave_path.as_ref() else {
+            self.set_status("Autosave is unavailable on this platform");
+            return;
+        };
+        match load_latest_autosave(path) {
+            Ok(project) => self.autosave_recovery_available = project.is_some(),
+            Err(error) => {
+                self.set_status(format!("Autosave recovery check failed: {error}"));
+                self.autosave_recovery_available = true;
+            }
+        }
+    }
+
+    /// Applies the latest valid autosave and schedules it for another safe write.
+    fn recover_autosave(&mut self) {
+        let Some(path) = self.autosave_path.as_ref() else {
+            self.set_status("Autosave recovery is unavailable");
+            return;
+        };
+        match load_latest_autosave(path) {
+            Ok(Some(project)) => {
+                self.project = project;
+                self.file_path = None;
+                self.autosave_recovery_available = false;
+                self.autosave_dirty = true;
+                self.autosave_countdown = 1.5;
+                self.set_status("Recovered the latest autosaved project");
+            }
+            Ok(None) => {
+                self.autosave_recovery_available = false;
+                self.set_status("No autosaved project is available");
+            }
+            Err(error) => {
+                self.set_status(format!("Autosave recovery failed: {error}"));
+            }
+        }
+    }
+
+    /// Discards both autosave slots after the user declines recovery.
+    fn discard_autosave(&mut self) {
+        match self.clear_autosave_files() {
+            Ok(()) => {
+                self.autosave_recovery_available = false;
+                self.autosave_dirty = false;
+                self.set_status("Discarded the recovered project snapshot");
+            }
+            Err(error) => self.set_status(format!("Could not discard autosave: {error}")),
+        }
+    }
+
+    /// Removes autosave snapshots after explicit save or loading another project.
+    fn clear_autosave_files(&self) -> std::io::Result<()> {
+        let Some(base_path) = self.autosave_path.as_ref() else {
+            return Ok(());
+        };
+        for path in [
+            base_path.with_file_name("autosave-0.json"),
+            base_path.with_file_name("autosave-1.json"),
+            base_path.with_file_name(format!("autosave-0.tmp-{}", std::process::id())),
+            base_path.with_file_name(format!("autosave-1.tmp-{}", std::process::id())),
+        ] {
+            match fs::remove_file(path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(())
+    }
+
+    /// Captures every project change, updates undo history, and debounces autosave.
+    fn finish_project_frame(&mut self, before: Project, context: &egui::Context) {
+        let changed = match (
+            serde_json::to_value(&before),
+            serde_json::to_value(&self.project),
+        ) {
+            (Ok(before), Ok(after)) => before != after,
+            (Err(error), _) | (_, Err(error)) => {
+                self.set_status(format!("Could not compare project state: {error}"));
+                false
+            }
+        };
+        if changed {
+            if !self.history_action_this_frame {
+                let already_recorded = self
+                    .undo_stack
+                    .last()
+                    .and_then(|snapshot| serde_json::to_value(snapshot).ok())
+                    .is_some_and(|snapshot| {
+                        serde_json::to_value(&before).is_ok_and(|previous| snapshot == previous)
+                    });
+                if !already_recorded {
+                    self.undo_stack.push(before);
+                    self.undo_stack.truncate(50);
+                    self.redo_stack.clear();
+                }
+            }
+            self.autosave_dirty = true;
+            self.autosave_countdown = 1.5;
+        }
+
+        if !self.autosave_dirty {
+            return;
+        }
+        context.request_repaint_after(std::time::Duration::from_millis(250));
+        self.autosave_countdown -= context.input(|input| input.stable_dt);
+        if self.autosave_countdown > 0.0 {
+            return;
+        }
+
+        let Some(path) = self.autosave_path.as_ref() else {
+            self.set_status("Project changed but autosave path is unavailable");
+            self.autosave_countdown = 10.0;
+            return;
+        };
+        match save_autosave(path, &self.project) {
+            Ok(()) => {
+                self.autosave_dirty = false;
+            }
+            Err(error) => {
+                self.set_status(format!("Autosave failed: {error}"));
+                self.autosave_countdown = 10.0;
+            }
+        }
+    }
+
     /// Opens and decodes a project selected with the native file picker.
     fn open_project(&mut self) {
         let Some(path) = FileDialog::new()
@@ -286,13 +548,27 @@ impl CineSchedApp {
         else {
             return;
         };
+        self.open_project_path(path);
+    }
+
+    /// Loads a project path and records it for the Open Recent menu.
+    fn open_project_path(&mut self, path: std::path::PathBuf) {
         match load_project(&path) {
             Ok(project) => {
                 self.project = project;
                 self.file_path = Some(path.clone());
-                self.status = format!("Opened {}", path.display());
+                record_recent_project(&mut self.recent_projects, path.clone());
+                self.autosave_dirty = false;
+                self.autosave_recovery_available = false;
+                self.set_status(match self.clear_autosave_files() {
+                    Ok(()) => format!("Opened {}", path.display()),
+                    Err(error) => format!(
+                        "Opened {}, but could not clear old autosave: {error}",
+                        path.display()
+                    ),
+                });
             }
-            Err(error) => self.status = format!("Open failed: {error}"),
+            Err(error) => self.set_status(format!("Open failed: {error}")),
         }
     }
 
@@ -300,8 +576,18 @@ impl CineSchedApp {
     fn save_current_project(&mut self) {
         if let Some(path) = self.file_path.clone() {
             match save_project(&path, &self.project) {
-                Ok(()) => self.status = format!("Saved {}", path.display()),
-                Err(error) => self.status = format!("Save failed: {error}"),
+                Ok(()) => {
+                    record_recent_project(&mut self.recent_projects, path.clone());
+                    self.autosave_dirty = false;
+                    self.set_status(match self.clear_autosave_files() {
+                        Ok(()) => format!("Saved {}", path.display()),
+                        Err(error) => format!(
+                            "Saved {}, but could not clear autosave: {error}",
+                            path.display()
+                        ),
+                    });
+                }
+                Err(error) => self.set_status(format!("Save failed: {error}")),
             }
         } else {
             self.save_project_as();
@@ -320,9 +606,17 @@ impl CineSchedApp {
         match save_project(&path, &self.project) {
             Ok(()) => {
                 self.file_path = Some(path.clone());
-                self.status = format!("Saved {}", path.display());
+                record_recent_project(&mut self.recent_projects, path.clone());
+                self.autosave_dirty = false;
+                self.set_status(match self.clear_autosave_files() {
+                    Ok(()) => format!("Saved {}", path.display()),
+                    Err(error) => format!(
+                        "Saved {}, but could not clear autosave: {error}",
+                        path.display()
+                    ),
+                });
             }
-            Err(error) => self.status = format!("Save failed: {error}"),
+            Err(error) => self.set_status(format!("Save failed: {error}")),
         }
     }
 
@@ -342,9 +636,9 @@ impl CineSchedApp {
                 self.record_undo();
                 let count = scenes.len();
                 self.project.all_scenes.extend(scenes);
-                self.status = format!("Imported {count} scenes from {}", path.display());
+                self.set_status(format!("Imported {count} scenes from {}", path.display()));
             }
-            Err(error) => self.status = format!("Script import failed: {error}"),
+            Err(error) => self.set_status(format!("Script import failed: {error}")),
         }
     }
 
@@ -360,7 +654,8 @@ impl CineSchedApp {
         if let Some(previous) = self.undo_stack.pop() {
             self.redo_stack
                 .push(std::mem::replace(&mut self.project, previous));
-            self.status = "Undid the last change".to_owned();
+            self.set_status("Undid the last change");
+            self.history_action_this_frame = true;
         }
     }
 
@@ -369,14 +664,15 @@ impl CineSchedApp {
         if let Some(next) = self.redo_stack.pop() {
             self.undo_stack
                 .push(std::mem::replace(&mut self.project, next));
-            self.status = "Redid the last change".to_owned();
+            self.set_status("Redid the last change");
+            self.history_action_this_frame = true;
         }
     }
 
     /// Adds a banner or scene event to a calendar date, creating the day if needed.
     fn add_scene_to_date(&mut self, scene: Scene, date: NaiveDate) {
         let Some(timestamp) = local_day(date) else {
-            self.status = "Could not interpret the selected calendar date".to_owned();
+            self.set_status("Could not interpret the selected calendar date");
             return;
         };
         self.record_undo();
@@ -402,10 +698,12 @@ impl CineSchedApp {
         else {
             return;
         };
-        self.status = match export_schedule_pdf(&self.project, &path) {
-            Ok(()) => format!("Exported {}", path.display()),
-            Err(error) => format!("Schedule export failed: {error}"),
-        };
+        self.set_status(
+            match export_schedule_pdf_localized(&self.project, self.language, &path) {
+                Ok(()) => format!("Exported {}", path.display()),
+                Err(error) => format!("Schedule export failed: {error}"),
+            },
+        );
     }
 
     /// Edits call-sheet milestones, weather, locations, and notes for one day.
@@ -435,7 +733,7 @@ impl CineSchedApp {
             .as_ref()
             .map(|production| production.location_roster.clone())
             .unwrap_or_default();
-        egui::Window::new("Call Sheet")
+        egui::Window::new(translate(self.language, "Call Sheet"))
             .open(&mut open)
             .default_width(800.0)
             .default_height(700.0)
@@ -446,90 +744,120 @@ impl CineSchedApp {
                     .iter_mut()
                     .find(|day| day.id == day_id)
                 {
-                    ui.heading(day.date.format("%A, %B %d, %Y").to_string());
+                    ui.heading(format_long_date(day.date.date_naive(), self.language));
                     egui::ScrollArea::vertical().show(ui, |ui| {
-                        ui.collapsing("General and Schedule", |ui| {
+                        ui.collapsing(translate(self.language, "General and Schedule"), |ui| {
                             project_changed |= labeled_text(
                                 ui,
-                                "General Call",
+                                &translate(self.language, "General Call"),
                                 &mut day.call_sheet.general_call_time,
                             );
                             project_changed |= labeled_text(
                                 ui,
-                                "Estimated Workday Schedule",
+                                &translate(self.language, "Estimated Workday Schedule"),
                                 &mut day.call_sheet.work_day_schedule,
                             );
                             project_changed |= labeled_text(
                                 ui,
-                                "Quote of the Day",
+                                &translate(self.language, "Quote of the Day"),
                                 &mut day.call_sheet.quote_of_the_day,
                             );
                             project_changed |= labeled_text(
                                 ui,
-                                "Ready to Shoot",
+                                &translate(self.language, "Ready to Shoot"),
                                 &mut day.call_sheet.ready_to_shoot_time,
                             );
-                            project_changed |=
-                                labeled_text(ui, "Lunch", &mut day.call_sheet.lunch_time);
-                            project_changed |=
-                                labeled_text(ui, "Snack", &mut day.call_sheet.snack_time);
-                            project_changed |=
-                                labeled_text(ui, "Dinner", &mut day.call_sheet.dinner_time);
-                            project_changed |=
-                                labeled_text(ui, "Estimated Wrap", &mut day.call_sheet.wrap_time);
                             project_changed |= labeled_text(
                                 ui,
-                                "Production Manager Contact",
+                                &translate(self.language, "Lunch"),
+                                &mut day.call_sheet.lunch_time,
+                            );
+                            project_changed |= labeled_text(
+                                ui,
+                                &translate(self.language, "Snack"),
+                                &mut day.call_sheet.snack_time,
+                            );
+                            project_changed |= labeled_text(
+                                ui,
+                                &translate(self.language, "Dinner"),
+                                &mut day.call_sheet.dinner_time,
+                            );
+                            project_changed |= labeled_text(
+                                ui,
+                                &translate(self.language, "Estimated Wrap"),
+                                &mut day.call_sheet.wrap_time,
+                            );
+                            project_changed |= labeled_text(
+                                ui,
+                                &translate(self.language, "Production Manager Contact"),
                                 &mut day.call_sheet.prod_manager_contact,
                             );
                             project_changed |= labeled_text(
                                 ui,
-                                "Assistant Director Contact",
+                                &translate(self.language, "Assistant Director Contact"),
                                 &mut day.call_sheet.ad_contact,
                             );
                             project_changed |= labeled_text(
                                 ui,
-                                "Nearest Hospital / Emergency Facility",
+                                &translate(self.language, "Nearest Hospital / Emergency Facility"),
                                 &mut day.call_sheet.nearest_hospital,
                             );
                         });
-                        ui.collapsing("Weather and Sun Times", |ui| {
-                            project_changed |=
-                                labeled_text(ui, "Temperature", &mut day.call_sheet.weather_temp);
+                        ui.collapsing(translate(self.language, "Weather and Sun Times"), |ui| {
                             project_changed |= labeled_text(
                                 ui,
-                                "Sky Condition",
+                                &translate(self.language, "Temperature"),
+                                &mut day.call_sheet.weather_temp,
+                            );
+                            project_changed |= labeled_text(
+                                ui,
+                                &translate(self.language, "Sky Condition"),
                                 &mut day.call_sheet.weather_condition,
                             );
                             project_changed |= labeled_text(
                                 ui,
-                                "Precipitation and Wind",
+                                &translate(self.language, "Precipitation and Wind"),
                                 &mut day.call_sheet.weather_precip_wind,
                             );
-                            project_changed |=
-                                labeled_text(ui, "Sunrise / Sunset", &mut day.call_sheet.sun_times);
+                            project_changed |= labeled_text(
+                                ui,
+                                &translate(self.language, "Sunrise / Sunset"),
+                                &mut day.call_sheet.sun_times,
+                            );
                         });
-                        ui.collapsing("Locations and Basecamp", |ui| {
-                            project_changed |=
-                                labeled_text(ui, "Basecamp", &mut day.call_sheet.basecamp_location);
-                            if ui.button("Add Location").clicked() {
+                        ui.collapsing(translate(self.language, "Locations and Basecamp"), |ui| {
+                            project_changed |= labeled_text(
+                                ui,
+                                &translate(self.language, "Basecamp"),
+                                &mut day.call_sheet.basecamp_location,
+                            );
+                            if ui
+                                .button(translate(self.language, "Add Location"))
+                                .clicked()
+                            {
                                 day.call_sheet.locations.push(Default::default());
                                 project_changed = true;
                             }
-                            ui.menu_button("Add from Location Roster", |ui| {
-                                for location in &location_roster {
-                                    if ui.button(&location.name).clicked() {
-                                        if !day.call_sheet.locations.iter().any(|existing| {
-                                            existing.name.eq_ignore_ascii_case(&location.name)
-                                        }) {
-                                            day.call_sheet.locations.push(location.clone());
-                                            project_changed = true;
+                            ui.menu_button(
+                                translate(self.language, "Add from Location Roster"),
+                                |ui| {
+                                    for location in &location_roster {
+                                        if ui.button(&location.name).clicked() {
+                                            if !day.call_sheet.locations.iter().any(|existing| {
+                                                existing.name.eq_ignore_ascii_case(&location.name)
+                                            }) {
+                                                day.call_sheet.locations.push(location.clone());
+                                                project_changed = true;
+                                            }
+                                            ui.close_menu();
                                         }
-                                        ui.close_menu();
                                     }
-                                }
-                            });
-                            if ui.button("Populate from Scene Locations").clicked() {
+                                },
+                            );
+                            if ui
+                                .button(translate(self.language, "Populate from Scene Locations"))
+                                .clicked()
+                            {
                                 project_changed |=
                                     populate_call_sheet_locations(day, &location_roster);
                             }
@@ -542,7 +870,10 @@ impl CineSchedApp {
                                         ui.text_edit_singleline(&mut location.name).changed();
                                     project_changed |=
                                         ui.text_edit_singleline(&mut location.address).changed();
-                                    if ui.small_button("Remove").clicked() {
+                                    if ui
+                                        .small_button(translate(self.language, "Remove"))
+                                        .clicked()
+                                    {
                                         remove_location = Some(index);
                                     }
                                 });
@@ -552,11 +883,20 @@ impl CineSchedApp {
                                 project_changed = true;
                             }
                         });
-                        ui.collapsing("Cast Calls", |ui| {
-                            if ui.button("Populate / Update Cast from Scenes").clicked() {
+                        ui.collapsing(translate(self.language, "Cast Calls"), |ui| {
+                            if ui
+                                .button(translate(
+                                    self.language,
+                                    "Populate / Update Cast from Scenes",
+                                ))
+                                .clicked()
+                            {
                                 project_changed |= populate_cast_calls(day, &production_cast);
                             }
-                            if ui.button("Add Cast Row").clicked() {
+                            if ui
+                                .button(translate(self.language, "Add Cast Row"))
+                                .clicked()
+                            {
                                 day.call_sheet
                                     .cast_call_entries
                                     .push(CastCallEntry::default());
@@ -567,38 +907,60 @@ impl CineSchedApp {
                                 day.call_sheet.cast_call_entries.iter_mut().enumerate()
                             {
                                 ui.group(|ui| {
-                                    ui.label(format!("Cast member {}", index + 1));
+                                    ui.label(format!(
+                                        "{} {}",
+                                        translate(self.language, "Cast member"),
+                                        index + 1
+                                    ));
                                     ui.horizontal_wrapped(|ui| {
                                         project_changed |= labeled_text(
                                             ui,
-                                            "Character",
+                                            &translate(self.language, "Character"),
                                             &mut entry.character_name,
                                         );
-                                        project_changed |=
-                                            labeled_text(ui, "Actor", &mut entry.actor_name);
-                                        project_changed |=
-                                            labeled_text(ui, "Scenes", &mut entry.scene_numbers);
+                                        project_changed |= labeled_text(
+                                            ui,
+                                            &translate(self.language, "Actor"),
+                                            &mut entry.actor_name,
+                                        );
+                                        project_changed |= labeled_text(
+                                            ui,
+                                            &translate(self.language, "Scenes"),
+                                            &mut entry.scene_numbers,
+                                        );
                                         project_changed |=
                                             labeled_text(ui, "ECDT", &mut entry.ecdt);
                                     });
                                     ui.horizontal_wrapped(|ui| {
-                                        project_changed |=
-                                            labeled_text(ui, "Pickup", &mut entry.pickup_time);
                                         project_changed |= labeled_text(
                                             ui,
-                                            "HMU / Wardrobe",
+                                            &translate(self.language, "Pickup"),
+                                            &mut entry.pickup_time,
+                                        );
+                                        project_changed |= labeled_text(
+                                            ui,
+                                            &translate(self.language, "HMU / Wardrobe"),
                                             &mut entry.hmu_wardrobe_time,
                                         );
-                                        project_changed |=
-                                            labeled_text(ui, "On Set", &mut entry.on_set_time);
-                                        project_changed |=
-                                            labeled_text(ui, "Wrap", &mut entry.wrap_time);
                                         project_changed |= labeled_text(
                                             ui,
-                                            "Location #",
+                                            &translate(self.language, "On Set"),
+                                            &mut entry.on_set_time,
+                                        );
+                                        project_changed |= labeled_text(
+                                            ui,
+                                            &translate(self.language, "Wrap"),
+                                            &mut entry.wrap_time,
+                                        );
+                                        project_changed |= labeled_text(
+                                            ui,
+                                            &translate(self.language, "Location #"),
                                             &mut entry.location_index,
                                         );
-                                        if ui.small_button("Remove").clicked() {
+                                        if ui
+                                            .small_button(translate(self.language, "Remove"))
+                                            .clicked()
+                                        {
                                             remove_cast = Some(index);
                                         }
                                     });
@@ -609,8 +971,11 @@ impl CineSchedApp {
                                 project_changed = true;
                             }
                         });
-                        ui.collapsing("Crew Calls", |ui| {
-                            if ui.button("Load Crew from Production Setup").clicked() {
+                        ui.collapsing(translate(self.language, "Crew Calls"), |ui| {
+                            if ui
+                                .button(translate(self.language, "Load Crew from Production Setup"))
+                                .clicked()
+                            {
                                 let general_call_time = day.call_sheet.general_call_time.clone();
                                 project_changed |= populate_crew_calls(
                                     &production_crew,
@@ -618,7 +983,10 @@ impl CineSchedApp {
                                     &general_call_time,
                                 );
                             }
-                            if ui.button("Add Crew Row").clicked() {
+                            if ui
+                                .button(translate(self.language, "Add Crew Row"))
+                                .clicked()
+                            {
                                 day.call_sheet
                                     .crew_call_entries
                                     .push(CrewCallEntry::default());
@@ -629,12 +997,30 @@ impl CineSchedApp {
                                 day.call_sheet.crew_call_entries.iter_mut().enumerate()
                             {
                                 ui.horizontal_wrapped(|ui| {
-                                    project_changed |= labeled_text(ui, "Role", &mut entry.role);
-                                    project_changed |= labeled_text(ui, "Name", &mut entry.name);
-                                    project_changed |=
-                                        labeled_text(ui, "Call Time", &mut entry.call_time);
-                                    project_changed |= labeled_text(ui, "Phone", &mut entry.phone);
-                                    if ui.small_button("Remove").clicked() {
+                                    project_changed |= labeled_text(
+                                        ui,
+                                        &translate(self.language, "Role"),
+                                        &mut entry.role,
+                                    );
+                                    project_changed |= labeled_text(
+                                        ui,
+                                        &translate(self.language, "Name"),
+                                        &mut entry.name,
+                                    );
+                                    project_changed |= labeled_text(
+                                        ui,
+                                        &translate(self.language, "Call Time"),
+                                        &mut entry.call_time,
+                                    );
+                                    project_changed |= labeled_text(
+                                        ui,
+                                        &translate(self.language, "Phone"),
+                                        &mut entry.phone,
+                                    );
+                                    if ui
+                                        .small_button(translate(self.language, "Remove"))
+                                        .clicked()
+                                    {
                                         remove_crew = Some(index);
                                     }
                                 });
@@ -644,11 +1030,11 @@ impl CineSchedApp {
                                 project_changed = true;
                             }
                         });
-                        ui.collapsing("Production Notes", |ui| {
-                            ui.label("Call sheet notes");
+                        ui.collapsing(translate(self.language, "Production Notes"), |ui| {
+                            ui.label(translate(self.language, "Call sheet notes"));
                             project_changed |=
                                 ui.text_edit_multiline(&mut day.call_sheet.notes).changed();
-                            ui.label("Production notes (one per line)");
+                            ui.label(translate(self.language, "Production notes (one per line)"));
                             let mut production_notes = day.call_sheet.production_notes.join("\n");
                             if ui.text_edit_multiline(&mut production_notes).changed() {
                                 day.call_sheet.production_notes = production_notes
@@ -661,7 +1047,10 @@ impl CineSchedApp {
                             }
                         });
                     });
-                    if ui.button("Export Call Sheet PDF...").clicked() {
+                    if ui
+                        .button(translate(self.language, "Export Call Sheet PDF..."))
+                        .clicked()
+                    {
                         export_requested = true;
                     }
                 }
@@ -680,10 +1069,17 @@ impl CineSchedApp {
                 .set_file_name("Call Sheet.pdf")
                 .save_file()
             {
-                self.status = match export_call_sheet_pdf(&self.project, day_id, path) {
-                    Ok(()) => "Call sheet PDF exported".to_owned(),
-                    Err(error) => format!("Call sheet export failed: {error}"),
-                };
+                self.set_status(
+                    match export_call_sheet_pdf_localized(
+                        &self.project,
+                        day_id,
+                        self.language,
+                        path,
+                    ) {
+                        Ok(()) => "Call sheet PDF exported".to_owned(),
+                        Err(error) => format!("Call sheet export failed: {error}"),
+                    },
+                );
             }
         }
     }
@@ -694,7 +1090,7 @@ impl CineSchedApp {
             return;
         }
         let previous_project = self.project.clone();
-        egui::Window::new("Production Setup")
+        egui::Window::new(translate(self.language, "Production Setup"))
             .open(&mut self.show_production)
             .default_width(600.0)
             .show(context, |ui| {
@@ -703,35 +1099,38 @@ impl CineSchedApp {
                     .production_info
                     .get_or_insert_with(ProductionInfo::default);
                 ui.horizontal(|ui| {
-                    ui.label("Company");
+                    ui.label(translate(self.language, "Company"));
                     ui.text_edit_singleline(&mut production.company_name);
                 });
                 ui.horizontal(|ui| {
-                    ui.label("Director");
+                    ui.label(translate(self.language, "Director"));
                     ui.text_edit_singleline(&mut production.director_name);
                     ui.text_edit_singleline(&mut production.director_phone);
                 });
                 ui.horizontal(|ui| {
-                    ui.label("Producer");
+                    ui.label(translate(self.language, "Producer"));
                     ui.text_edit_singleline(&mut production.producer_name);
                     ui.text_edit_singleline(&mut production.producer_phone);
                 });
                 ui.horizontal(|ui| {
-                    ui.label("1st AD");
+                    ui.label(translate(self.language, "1st AD"));
                     ui.text_edit_singleline(&mut production.ad_name);
                     ui.text_edit_singleline(&mut production.ad_phone);
                 });
                 ui.horizontal(|ui| {
-                    ui.label("Company Contact");
+                    ui.label(translate(self.language, "Company Contact"));
                     ui.text_edit_singleline(&mut production.contact_number);
-                    ui.label("Lunch");
+                    ui.label(translate(self.language, "Lunch"));
                     ui.text_edit_singleline(&mut production.default_lunch_time);
                 });
 
                 ui.separator();
-                ui.heading("Cast and Character Roster");
+                ui.heading(translate(self.language, "Cast and Character Roster"));
                 ui.horizontal(|ui| {
-                    ui.label("New unavailability range (YYYY-MM-DD)");
+                    ui.label(translate(
+                        self.language,
+                        "New unavailability range (YYYY-MM-DD)",
+                    ));
                     ui.text_edit_singleline(&mut self.availability_start);
                     ui.text_edit_singleline(&mut self.availability_end);
                 });
@@ -739,7 +1138,10 @@ impl CineSchedApp {
                     ui.horizontal(|ui| {
                         ui.text_edit_singleline(&mut member.actor_name);
                         ui.text_edit_singleline(&mut member.character_name);
-                        if ui.small_button("Add range").clicked() {
+                        if ui
+                            .small_button(translate(self.language, "Add range"))
+                            .clicked()
+                        {
                             let start =
                                 NaiveDate::parse_from_str(&self.availability_start, "%Y-%m-%d");
                             let end = NaiveDate::parse_from_str(&self.availability_end, "%Y-%m-%d");
@@ -754,14 +1156,15 @@ impl CineSchedApp {
                                     }
                                 }
                                 _ => {
-                                    self.status = "Enter dates using YYYY-MM-DD".to_owned();
+                                    self.status =
+                                        translate(self.language, "Enter dates using YYYY-MM-DD");
                                 }
                             }
                         }
                     });
                     for range in &mut member.unavailable_ranges {
                         ui.horizontal(|ui| {
-                            ui.label("Unavailable");
+                            ui.label(translate(self.language, "Unavailable"));
                             let mut start = range.start.format("%Y-%m-%d").to_string();
                             if ui.text_edit_singleline(&mut start).changed() {
                                 if let Ok(date) = NaiveDate::parse_from_str(&start, "%Y-%m-%d") {
@@ -770,7 +1173,7 @@ impl CineSchedApp {
                                     }
                                 }
                             }
-                            ui.label("through");
+                            ui.label(translate(self.language, "through"));
                             let mut end = range.end.format("%Y-%m-%d").to_string();
                             if ui.text_edit_singleline(&mut end).changed() {
                                 if let Ok(date) = NaiveDate::parse_from_str(&end, "%Y-%m-%d") {
@@ -785,7 +1188,9 @@ impl CineSchedApp {
                 ui.horizontal(|ui| {
                     ui.text_edit_singleline(&mut self.new_cast_actor);
                     ui.text_edit_singleline(&mut self.new_cast_character);
-                    if ui.button("Add Cast Member").clicked()
+                    if ui
+                        .button(translate(self.language, "Add Cast Member"))
+                        .clicked()
                         && !self.new_cast_character.trim().is_empty()
                     {
                         self.undo_stack.push(previous_project.clone());
@@ -801,10 +1206,13 @@ impl CineSchedApp {
                 });
 
                 ui.separator();
-                ui.heading("Crew Roster");
+                ui.heading(translate(self.language, "Crew Roster"));
                 for crew in &mut production.crew {
                     ui.horizontal(|ui| {
-                        ui.checkbox(&mut crew.is_daily_default, "Daily");
+                        ui.checkbox(
+                            &mut crew.is_daily_default,
+                            translate(self.language, "Daily"),
+                        );
                         ui.text_edit_singleline(&mut crew.name);
                         ui.text_edit_singleline(&mut crew.role);
                         ui.text_edit_singleline(&mut crew.phone);
@@ -813,7 +1221,9 @@ impl CineSchedApp {
                 ui.horizontal(|ui| {
                     ui.text_edit_singleline(&mut self.new_crew_name);
                     ui.text_edit_singleline(&mut self.new_crew_role);
-                    if ui.button("Add Crew Member").clicked()
+                    if ui
+                        .button(translate(self.language, "Add Crew Member"))
+                        .clicked()
                         && !self.new_crew_name.trim().is_empty()
                     {
                         self.undo_stack.push(previous_project.clone());
@@ -835,12 +1245,15 @@ impl CineSchedApp {
         if !self.show_conflicts {
             return;
         }
-        egui::Window::new("Cast Availability Conflicts")
+        egui::Window::new(translate(self.language, "Cast Availability Conflicts"))
             .open(&mut self.show_conflicts)
             .show(context, |ui| {
                 let conflicts = self.project.scan_conflicts();
                 if conflicts.is_empty() {
-                    ui.label("No cast availability conflicts found.");
+                    ui.label(translate(
+                        self.language,
+                        "No cast availability conflicts found.",
+                    ));
                 }
                 for conflict in conflicts {
                     ui.label(format!(
@@ -859,17 +1272,28 @@ impl CineSchedApp {
         if !self.show_lock_report {
             return;
         }
-        egui::Window::new("Schedule Lock Report")
+        egui::Window::new(translate(self.language, "Schedule Lock Report"))
             .open(&mut self.show_lock_report)
             .show(context, |ui| {
                 let changes = self.project.schedule_lock_changes();
                 if changes.is_empty() {
-                    ui.label("No schedule changes since the lock.");
+                    ui.label(translate(
+                        self.language,
+                        "No schedule changes since the lock.",
+                    ));
                 }
                 for change in changes {
                     ui.heading(&change.actor_display_name);
-                    ui.label(format!("Added: {}", format_dates(&change.added_days)));
-                    ui.label(format!("Removed: {}", format_dates(&change.removed_days)));
+                    ui.label(format!(
+                        "{} {}",
+                        translate(self.language, "Added:"),
+                        format_dates(&change.added_days)
+                    ));
+                    ui.label(format!(
+                        "{} {}",
+                        translate(self.language, "Removed:"),
+                        format_dates(&change.removed_days)
+                    ));
                 }
             });
     }
@@ -880,37 +1304,37 @@ impl CineSchedApp {
             return;
         };
         let mut open = true;
-        egui::Window::new("Edit Scene")
+        egui::Window::new(translate(self.language, "Edit Scene"))
             .open(&mut open)
             .default_width(560.0)
             .show(context, |ui| {
                 if let Some(scene) = self.project.scene_mut(scene_id) {
                     ui.horizontal(|ui| {
-                        ui.label("Scene Number");
+                        ui.label(translate(self.language, "Scene Number"));
                         ui.text_edit_singleline(&mut scene.scene_number);
-                        ui.label("Page Eighths");
+                        ui.label(translate(self.language, "Page Eighths"));
                         ui.add(egui::DragValue::new(&mut scene.duration).range(0..=999));
                     });
-                    ui.label("Heading");
+                    ui.label(translate(self.language, "Heading"));
                     ui.text_edit_singleline(&mut scene.title);
                     ui.horizontal(|ui| {
-                        ui.label("Estimated Minutes");
+                        ui.label(translate(self.language, "Estimated Minutes"));
                         ui.add(egui::DragValue::new(&mut scene.estimated_time).range(0..=9999));
-                        ui.label("Time of Day");
+                        ui.label(translate(self.language, "Time of Day"));
                         egui::ComboBox::from_id_salt(("time-of-day", scene_id))
-                            .selected_text(&scene.day_night_type)
+                            .selected_text(translate(self.language, &scene.day_night_type))
                             .show_ui(ui, |ui| {
                                 for value in ["DAY", "NIGHT", "DAWN", "DUSK", "AFTERNOON", "CUSTOM"]
                                 {
                                     ui.selectable_value(
                                         &mut scene.day_night_type,
                                         value.to_owned(),
-                                        value,
+                                        translate(self.language, value),
                                     );
                                 }
                             });
                     });
-                    ui.label("Cast (comma separated)");
+                    ui.label(translate(self.language, "Cast (comma separated)"));
                     let mut cast = scene.cast.join(", ");
                     if ui.text_edit_singleline(&mut cast).changed() {
                         scene.cast = cast
@@ -920,17 +1344,20 @@ impl CineSchedApp {
                             .map(str::to_owned)
                             .collect();
                     }
-                    ui.label("Summary");
+                    ui.label(translate(self.language, "Summary"));
                     ui.text_edit_multiline(&mut scene.summary);
                     ui.horizontal(|ui| {
-                        ui.label("Real Location");
+                        ui.label(translate(self.language, "Real Location"));
                         ui.text_edit_singleline(&mut scene.real_location);
                     });
                     ui.horizontal(|ui| {
-                        ui.label("Address");
+                        ui.label(translate(self.language, "Address"));
                         ui.text_edit_singleline(&mut scene.location_address);
                     });
-                    ui.checkbox(&mut scene.is_completed, "Completed");
+                    ui.checkbox(
+                        &mut scene.is_completed,
+                        translate(self.language, "Completed"),
+                    );
                     for (label, values) in [
                         ("Extras", &mut scene.extras),
                         ("Props", &mut scene.props),
@@ -945,7 +1372,7 @@ impl CineSchedApp {
                     ] {
                         edit_tag_list(ui, label, values);
                     }
-                    ui.label("Breakdown Notes");
+                    ui.label(translate(self.language, "Breakdown Notes"));
                     ui.text_edit_multiline(&mut scene.breakdown_notes);
                 }
             });
@@ -963,10 +1390,12 @@ impl CineSchedApp {
         else {
             return;
         };
-        self.status = match export_breakdowns_pdf(&self.project, &path) {
-            Ok(()) => format!("Exported {}", path.display()),
-            Err(error) => format!("Breakdown export failed: {error}"),
-        };
+        self.set_status(
+            match export_breakdowns_pdf_localized(&self.project, self.language, &path) {
+                Ok(()) => format!("Exported {}", path.display()),
+                Err(error) => format!("Breakdown export failed: {error}"),
+            },
+        );
     }
 
     /// Exports a cast days-out-of-days matrix to a PDF selected by the user.
@@ -978,10 +1407,17 @@ impl CineSchedApp {
         else {
             return;
         };
-        self.status = match export_days_out_of_days_pdf(&self.project, self.include_hold, &path) {
-            Ok(()) => format!("Exported {}", path.display()),
-            Err(error) => format!("DOOD export failed: {error}"),
-        };
+        self.set_status(
+            match export_days_out_of_days_pdf_localized(
+                &self.project,
+                self.include_hold,
+                self.language,
+                &path,
+            ) {
+                Ok(()) => format!("Exported {}", path.display()),
+                Err(error) => format!("DOOD export failed: {error}"),
+            },
+        );
     }
 
     /// Exports the currently displayed calendar month.
@@ -993,15 +1429,18 @@ impl CineSchedApp {
         else {
             return;
         };
-        self.status = match export_month_calendar_pdf(
-            &self.project,
-            self.month.year(),
-            self.month.month(),
-            path,
-        ) {
-            Ok(()) => "Monthly calendar PDF exported".to_owned(),
-            Err(error) => format!("Calendar export failed: {error}"),
-        };
+        self.set_status(
+            match export_month_calendar_pdf_localized(
+                &self.project,
+                self.month.year(),
+                self.month.month(),
+                self.language,
+                path,
+            ) {
+                Ok(()) => "Monthly calendar PDF exported".to_owned(),
+                Err(error) => format!("Calendar export failed: {error}"),
+            },
+        );
     }
 
     /// Exports all scheduled scene strips as a stripboard PDF.
@@ -1013,10 +1452,12 @@ impl CineSchedApp {
         else {
             return;
         };
-        self.status = match export_stripboard_pdf(&self.project, path) {
-            Ok(()) => "Stripboard PDF exported".to_owned(),
-            Err(error) => format!("Stripboard export failed: {error}"),
-        };
+        self.set_status(
+            match export_stripboard_pdf_localized(&self.project, self.language, path) {
+                Ok(()) => "Stripboard PDF exported".to_owned(),
+                Err(error) => format!("Stripboard export failed: {error}"),
+            },
+        );
     }
 
     /// Exports a day timeline calculated from call times and scene estimates.
@@ -1028,10 +1469,12 @@ impl CineSchedApp {
         else {
             return;
         };
-        self.status = match export_timeline_pdf(&self.project, path) {
-            Ok(()) => "One-line schedule PDF exported".to_owned(),
-            Err(error) => format!("One-line export failed: {error}"),
-        };
+        self.set_status(
+            match export_timeline_pdf_localized(&self.project, self.language, path) {
+                Ok(()) => "One-line schedule PDF exported".to_owned(),
+                Err(error) => format!("One-line export failed: {error}"),
+            },
+        );
     }
 
     /// Adds a date range beginning today without replacing any existing days.
@@ -1052,15 +1495,44 @@ impl CineSchedApp {
             }
         }
         self.project.shoot_days.sort_by_key(|day| day.date);
-        self.status = "Added 30 calendar days".to_owned();
+        self.set_status("Added 30 calendar days");
     }
 
     /// Renders the list of unscheduled scenes with one-click scheduling actions.
     fn draw_boneyard(&mut self, ui: &mut egui::Ui) {
-        ui.heading("Boneyard");
+        ui.heading(translate(self.language, "Boneyard"));
+        let (_, dropped_scene_ids) =
+            ui.dnd_drop_zone::<Vec<Uuid>, _>(egui::Frame::group(ui.style()), |ui| {
+                ui.label(translate(
+                    self.language,
+                    "Drop scheduled scenes here to return them to the Boneyard",
+                ))
+            });
+        if let Some(scene_ids) = dropped_scene_ids {
+            let scheduled_ids: Vec<Uuid> = scene_ids
+                .iter()
+                .copied()
+                .filter(|scene_id| {
+                    self.project
+                        .shoot_days
+                        .iter()
+                        .any(|day| day.scenes.iter().any(|scene| scene.id == *scene_id))
+                })
+                .collect();
+            if !scheduled_ids.is_empty() {
+                self.record_undo();
+                for scene_id in &scheduled_ids {
+                    self.project.unschedule_scene(*scene_id);
+                }
+                self.set_status(format!(
+                    "Returned {} scenes to the Boneyard",
+                    scheduled_ids.len()
+                ));
+            }
+        }
         ui.text_edit_singleline(&mut self.search_query);
         egui::ComboBox::from_id_salt("boneyard-sort")
-            .selected_text(&self.boneyard_sort)
+            .selected_text(translate(self.language, &self.boneyard_sort))
             .show_ui(ui, |ui| {
                 for sort in [
                     "Show Order",
@@ -1070,11 +1542,15 @@ impl CineSchedApp {
                     "Cast",
                     "Day/Night",
                 ] {
-                    ui.selectable_value(&mut self.boneyard_sort, sort.to_owned(), sort);
+                    ui.selectable_value(
+                        &mut self.boneyard_sort,
+                        sort.to_owned(),
+                        translate(self.language, sort),
+                    );
                 }
             });
         if self.project.all_scenes.is_empty() {
-            ui.label("No unscheduled scenes.");
+            ui.label(translate(self.language, "No unscheduled scenes."));
             return;
         }
         let query = self.search_query.trim().to_ascii_lowercase();
@@ -1119,14 +1595,21 @@ impl CineSchedApp {
             .collect();
         ui.horizontal(|ui| {
             ui.label(format!(
-                "{} scenes selected",
-                self.selected_boneyard_scenes.len()
+                "{} {}",
+                self.selected_boneyard_scenes.len(),
+                translate(self.language, "scenes selected")
             ));
-            if ui.button("Select visible").clicked() {
+            if ui
+                .button(translate(self.language, "Select visible"))
+                .clicked()
+            {
                 self.selected_boneyard_scenes
                     .extend(scenes.iter().map(|(scene_id, _)| *scene_id));
             }
-            if ui.button("Clear selection").clicked() {
+            if ui
+                .button(translate(self.language, "Clear selection"))
+                .clicked()
+            {
                 self.selected_boneyard_scenes.clear();
             }
             if let Some(first_day) = self.project.shoot_days.first() {
@@ -1138,7 +1621,7 @@ impl CineSchedApp {
                             .iter()
                             .find(|day| day.id == day_id)
                             .map(|day| day.date.format("%b %d").to_string())
-                            .unwrap_or_else(|| "Choose day".to_owned()),
+                            .unwrap_or_else(|| translate(self.language, "Choose day")),
                     )
                     .show_ui(ui, |ui| {
                         for day in &self.project.shoot_days {
@@ -1153,57 +1636,70 @@ impl CineSchedApp {
                 if ui
                     .add_enabled(
                         !self.selected_boneyard_scenes.is_empty(),
-                        egui::Button::new("Schedule selected"),
+                        egui::Button::new(translate(self.language, "Schedule selected")),
                     )
                     .clicked()
                 {
                     let scheduled = self.schedule_selected_scenes(day_id);
-                    self.status = format!("Scheduled {scheduled} scenes");
+                    self.set_status(format!("Scheduled {scheduled} scenes"));
                 }
             }
         });
-        for (scene_id, title) in scenes {
-            ui.horizontal(|ui| {
-                let mut is_selected = self.selected_boneyard_scenes.contains(&scene_id);
-                if ui.checkbox(&mut is_selected, "").changed() {
-                    if is_selected {
-                        self.selected_boneyard_scenes.insert(scene_id);
-                    } else {
-                        self.selected_boneyard_scenes.remove(&scene_id);
+        for (scene_id, title) in &scenes {
+            let payload: Vec<Uuid> = if self.selected_boneyard_scenes.contains(scene_id) {
+                scenes
+                    .iter()
+                    .filter(|(candidate_id, _)| {
+                        self.selected_boneyard_scenes.contains(candidate_id)
+                    })
+                    .map(|(candidate_id, _)| *candidate_id)
+                    .collect()
+            } else {
+                vec![*scene_id]
+            };
+            ui.dnd_drag_source(egui::Id::new(("boneyard-scene", scene_id)), payload, |ui| {
+                ui.horizontal(|ui| {
+                    let mut is_selected = self.selected_boneyard_scenes.contains(scene_id);
+                    if ui.checkbox(&mut is_selected, "").changed() {
+                        if is_selected {
+                            self.selected_boneyard_scenes.insert(*scene_id);
+                        } else {
+                            self.selected_boneyard_scenes.remove(scene_id);
+                        }
                     }
-                }
-                if ui.selectable_label(false, title).clicked() {
-                    self.selected_scene = Some(scene_id);
-                }
-                if !self.project.shoot_days.is_empty() {
-                    let mut day_id = *self
-                        .schedule_targets
-                        .entry(scene_id)
-                        .or_insert(self.project.shoot_days[0].id);
-                    egui::ComboBox::from_id_salt(("schedule-day", scene_id))
-                        .selected_text(
-                            self.project
-                                .shoot_days
-                                .iter()
-                                .find(|day| day.id == day_id)
-                                .map(|day| day.date.format("%b %d").to_string())
-                                .unwrap_or_else(|| "Choose day".to_owned()),
-                        )
-                        .show_ui(ui, |ui| {
-                            for day in &self.project.shoot_days {
-                                ui.selectable_value(
-                                    &mut day_id,
-                                    day.id,
-                                    day.date.format("%b %d").to_string(),
-                                );
-                            }
-                        });
-                    self.schedule_targets.insert(scene_id, day_id);
-                    if ui.small_button("Add").clicked() {
-                        self.record_undo();
-                        self.project.schedule_scene(scene_id, day_id);
+                    if ui.selectable_label(false, title).clicked() {
+                        self.selected_scene = Some(*scene_id);
                     }
-                }
+                    if !self.project.shoot_days.is_empty() {
+                        let mut day_id = *self
+                            .schedule_targets
+                            .entry(*scene_id)
+                            .or_insert(self.project.shoot_days[0].id);
+                        egui::ComboBox::from_id_salt(("schedule-day", scene_id))
+                            .selected_text(
+                                self.project
+                                    .shoot_days
+                                    .iter()
+                                    .find(|day| day.id == day_id)
+                                    .map(|day| day.date.format("%b %d").to_string())
+                                    .unwrap_or_else(|| "Choose day".to_owned()),
+                            )
+                            .show_ui(ui, |ui| {
+                                for day in &self.project.shoot_days {
+                                    ui.selectable_value(
+                                        &mut day_id,
+                                        day.id,
+                                        day.date.format("%b %d").to_string(),
+                                    );
+                                }
+                            });
+                        self.schedule_targets.insert(*scene_id, day_id);
+                        if ui.small_button("Add").clicked() {
+                            self.record_undo();
+                            self.project.schedule_scene(*scene_id, day_id);
+                        }
+                    }
+                });
             });
         }
     }
@@ -1233,6 +1729,29 @@ impl CineSchedApp {
         scheduled
     }
 
+    /// Moves a drag payload to a schedule position and records one undo transaction.
+    fn accept_scene_drop(&mut self, scene_ids: &[Uuid], day_id: Uuid, position: usize) -> usize {
+        let moving_ids: Vec<Uuid> = scene_ids
+            .iter()
+            .copied()
+            .filter(|scene_id| self.project.scene(*scene_id).is_some())
+            .collect();
+        if moving_ids.is_empty() || !self.project.shoot_days.iter().any(|day| day.id == day_id) {
+            return 0;
+        }
+        self.record_undo();
+        let moved = self
+            .project
+            .move_scenes_to_day(&moving_ids, day_id, position);
+        for scene_id in &moving_ids {
+            self.selected_boneyard_scenes.remove(scene_id);
+        }
+        if moved > 0 {
+            self.set_status(format!("Moved {moved} scenes to the selected day"));
+        }
+        moved
+    }
+
     /// Renders calendar days and allows scenes to return to the Boneyard.
     fn draw_schedule(&mut self, ui: &mut egui::Ui) {
         if self.stripboard {
@@ -1244,16 +1763,16 @@ impl CineSchedApp {
 
     /// Draws a month grid with one editable schedule cell per calendar day.
     fn draw_calendar(&mut self, ui: &mut egui::Ui) {
-        ui.heading("Schedule");
+        ui.heading(translate(self.language, "Schedule"));
         ui.horizontal(|ui| {
             if ui.button("<").clicked() {
                 self.month = previous_month(self.month);
             }
-            ui.heading(self.month.format("%B %Y").to_string());
+            ui.heading(format_month(self.month, self.language));
             if ui.button(">").clicked() {
                 self.month = next_month(self.month);
             }
-            if ui.button("Today").clicked() {
+            if ui.button(translate(self.language, "Today")).clicked() {
                 let today = Local::now().date_naive();
                 self.month = NaiveDate::from_ymd_opt(today.year(), today.month(), 1)
                     .expect("the current year and month are valid");
@@ -1262,14 +1781,24 @@ impl CineSchedApp {
         ui.horizontal(|ui| {
             ui.text_edit_singleline(&mut self.event_title);
             ui.text_edit_singleline(&mut self.event_time);
-            if ui.small_button("Previous Day").clicked() {
+            if ui
+                .small_button(translate(self.language, "Previous Day"))
+                .clicked()
+            {
                 self.event_date -= Duration::days(1);
             }
             ui.label(self.event_date.format("%Y-%m-%d").to_string());
-            if ui.small_button("Next Day").clicked() {
+            if ui
+                .small_button(translate(self.language, "Next Day"))
+                .clicked()
+            {
                 self.event_date += Duration::days(1);
             }
-            if ui.button("Add Calendar Event").clicked() && !self.event_title.trim().is_empty() {
+            if ui
+                .button(translate(self.language, "Add Calendar Event"))
+                .clicked()
+                && !self.event_title.trim().is_empty()
+            {
                 self.add_scene_to_date(
                     Scene::create_calendar_event(self.event_title.trim(), self.event_time.trim()),
                     self.event_date,
@@ -1278,13 +1807,19 @@ impl CineSchedApp {
                 self.event_time.clear();
             }
             egui::ComboBox::from_id_salt("banner-kind")
-                .selected_text(&self.banner_type)
+                .selected_text(translate(self.language, &self.banner_type))
                 .show_ui(ui, |ui| {
                     for kind in ["Company Move", "Meal Break", "Notice", "Custom Banner"] {
-                        ui.selectable_value(&mut self.banner_type, kind.to_owned(), kind);
+                        ui.selectable_value(
+                            &mut self.banner_type,
+                            kind.to_owned(),
+                            translate(self.language, kind),
+                        );
                     }
                 });
-            if ui.button("Add Banner").clicked() && !self.event_title.trim().is_empty() {
+            if ui.button(translate(self.language, "Add Banner")).clicked()
+                && !self.event_title.trim().is_empty()
+            {
                 self.add_scene_to_date(
                     Scene::create_banner(
                         self.banner_type.clone(),
@@ -1298,7 +1833,7 @@ impl CineSchedApp {
                 self.event_time.clear();
             }
             egui::ComboBox::from_id_salt("meal-kind")
-                .selected_text(&self.meal_kind)
+                .selected_text(translate(self.language, &self.meal_kind))
                 .show_ui(ui, |ui| {
                     for kind in [
                         "General Call",
@@ -1308,16 +1843,23 @@ impl CineSchedApp {
                         "Dinner",
                         "Wrap",
                     ] {
-                        ui.selectable_value(&mut self.meal_kind, kind.to_owned(), kind);
+                        ui.selectable_value(
+                            &mut self.meal_kind,
+                            kind.to_owned(),
+                            translate(self.language, kind),
+                        );
                     }
                 });
-            if ui.button("Add Meal").clicked() {
+            if ui.button(translate(self.language, "Add Meal")).clicked() {
                 self.add_scene_to_date(
                     Scene::create_auto_meal(&self.meal_kind, self.event_time.trim()),
                     self.event_date,
                 );
             }
-            if ui.button("Add 30-Day Calendar").clicked() {
+            if ui
+                .button(translate(self.language, "Add 30-Day Calendar"))
+                .clicked()
+            {
                 self.add_calendar();
             }
         });
@@ -1338,7 +1880,7 @@ impl CineSchedApp {
             cell_dates.push(None);
         }
         for header in ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"] {
-            ui.label(header);
+            ui.label(translate(self.language, header));
         }
         for week in cell_dates.chunks(7) {
             ui.columns(7, |columns| {
@@ -1365,92 +1907,154 @@ impl CineSchedApp {
                                     .collect()
                             })
                             .unwrap_or_default();
-                        column.group(|ui| {
-                            ui.strong(date.day().to_string());
-                            if let Some(day_id) = self
-                                .project
-                                .shoot_days
-                                .iter()
-                                .find(|day| day.date.date_naive() == *date)
-                                .map(|day| day.id)
-                            {
-                                if ui.small_button("Call Sheet").clicked() {
-                                    self.selected_call_sheet = Some(day_id);
-                                }
-                                if ui
-                                    .small_button(if self.selected_day_for_move == Some(day_id) {
-                                        "Cancel day move"
-                                    } else {
-                                        "Move day..."
-                                    })
-                                    .clicked()
+                        let existing_day_id = self
+                            .project
+                            .shoot_days
+                            .iter()
+                            .find(|day| day.date.date_naive() == *date)
+                            .map(|day| day.id);
+                        let (_, dropped_scene_ids) = column.dnd_drop_zone::<Vec<Uuid>, _>(
+                            egui::Frame::group(column.style()),
+                            |ui| {
+                                ui.strong(date.day().to_string());
+                                if let Some(day_id) = self
+                                    .project
+                                    .shoot_days
+                                    .iter()
+                                    .find(|day| day.date.date_naive() == *date)
+                                    .map(|day| day.id)
                                 {
-                                    self.selected_day_for_move = (self.selected_day_for_move
-                                        != Some(day_id))
-                                    .then_some(day_id);
-                                }
-                                if let Some(source_day_id) = self
-                                    .selected_day_for_move
-                                    .filter(|source_day_id| *source_day_id != day_id)
-                                {
-                                    if ui.small_button("Swap with selected day").clicked() {
-                                        self.record_undo();
-                                        if self.project.swap_day_contents(source_day_id, day_id) {
-                                            self.selected_day_for_move = None;
-                                            self.status =
-                                                "Swapped schedule and call sheet between days"
-                                                    .to_owned();
+                                    if ui.small_button("Call Sheet").clicked() {
+                                        self.selected_call_sheet = Some(day_id);
+                                    }
+                                    if ui
+                                        .small_button(
+                                            if self.selected_day_for_move == Some(day_id) {
+                                                "Cancel day move"
+                                            } else {
+                                                "Move day..."
+                                            },
+                                        )
+                                        .clicked()
+                                    {
+                                        self.selected_day_for_move = (self.selected_day_for_move
+                                            != Some(day_id))
+                                        .then_some(day_id);
+                                    }
+                                    if let Some(source_day_id) = self
+                                        .selected_day_for_move
+                                        .filter(|source_day_id| *source_day_id != day_id)
+                                    {
+                                        if ui.small_button("Swap with selected day").clicked() {
+                                            self.record_undo();
+                                            if self.project.swap_day_contents(source_day_id, day_id)
+                                            {
+                                                self.selected_day_for_move = None;
+                                                self.set_status(
+                                                    "Swapped schedule and call sheet between days",
+                                                );
+                                            } else {
+                                                self.set_status(
+                                                    "Could not swap the selected shooting days",
+                                                );
+                                            }
+                                        }
+                                    }
+                                    let is_blackout = self
+                                        .project
+                                        .shoot_days
+                                        .iter()
+                                        .find(|day| day.id == day_id)
+                                        .is_some_and(|day| day.is_blackout);
+                                    if ui
+                                        .small_button(if is_blackout {
+                                            "Clear Blackout"
                                         } else {
-                                            self.status =
-                                                "Could not swap the selected shooting days"
-                                                    .to_owned();
+                                            "Blackout"
+                                        })
+                                        .clicked()
+                                    {
+                                        self.record_undo();
+                                        if let Some(day) = self
+                                            .project
+                                            .shoot_days
+                                            .iter_mut()
+                                            .find(|day| day.id == day_id)
+                                        {
+                                            day.is_blackout = !day.is_blackout;
                                         }
                                     }
                                 }
-                                let is_blackout = self
+                                for (position, (scene_id, title)) in scenes.into_iter().enumerate()
+                                {
+                                    let (drop_zone, dropped_scene_ids) = ui
+                                        .dnd_drop_zone::<Vec<Uuid>, _>(egui::Frame::NONE, |ui| {
+                                            ui.small_button(title)
+                                        });
+                                    if let Some(scene_ids) = dropped_scene_ids {
+                                        if let Some(day_id) = existing_day_id {
+                                            self.accept_scene_drop(&scene_ids, day_id, position);
+                                        }
+                                    }
+                                    if drop_zone.inner.clicked() {
+                                        self.selected_scene = Some(scene_id);
+                                    }
+                                }
+                                if self
+                                    .project
+                                    .shoot_days
+                                    .iter()
+                                    .all(|day| day.date.date_naive() != *date)
+                                    && ui
+                                        .small_button(translate(self.language, "Add Day"))
+                                        .clicked()
+                                {
+                                    if let Some(timestamp) = local_day(*date) {
+                                        self.record_undo();
+                                        self.project.shoot_days.push(ShootDay::new(timestamp));
+                                        self.project.shoot_days.sort_by_key(|day| day.date);
+                                    }
+                                }
+                            },
+                        );
+                        if let Some(scene_ids) = dropped_scene_ids {
+                            let (day_id, created_day) = match existing_day_id {
+                                Some(day_id) => (Some(day_id), false),
+                                None => {
+                                    if let Some(timestamp) = local_day(*date) {
+                                        self.record_undo();
+                                        let day = ShootDay::new(timestamp);
+                                        let day_id = day.id;
+                                        self.project.shoot_days.push(day);
+                                        self.project.shoot_days.sort_by_key(|day| day.date);
+                                        (Some(day_id), true)
+                                    } else {
+                                        (None, false)
+                                    }
+                                }
+                            };
+                            if let Some(day_id) = day_id {
+                                let position = self
                                     .project
                                     .shoot_days
                                     .iter()
                                     .find(|day| day.id == day_id)
-                                    .is_some_and(|day| day.is_blackout);
-                                if ui
-                                    .small_button(if is_blackout {
-                                        "Clear Blackout"
-                                    } else {
-                                        "Blackout"
-                                    })
-                                    .clicked()
-                                {
-                                    self.record_undo();
-                                    if let Some(day) = self
+                                    .map_or(0, |day| day.scenes.len());
+                                if created_day {
+                                    let moved = self
                                         .project
-                                        .shoot_days
-                                        .iter_mut()
-                                        .find(|day| day.id == day_id)
-                                    {
-                                        day.is_blackout = !day.is_blackout;
-                                    }
+                                        .move_scenes_to_day(&scene_ids, day_id, position);
+                                    self.set_status(format!(
+                                        "Moved {moved} scenes to the selected day"
+                                    ));
+                                } else {
+                                    self.accept_scene_drop(&scene_ids, day_id, position);
+                                }
+                                for scene_id in scene_ids.iter() {
+                                    self.selected_boneyard_scenes.remove(scene_id);
                                 }
                             }
-                            for (scene_id, title) in scenes {
-                                if ui.small_button(title).clicked() {
-                                    self.selected_scene = Some(scene_id);
-                                }
-                            }
-                            if self
-                                .project
-                                .shoot_days
-                                .iter()
-                                .all(|day| day.date.date_naive() != *date)
-                                && ui.small_button("Add Day").clicked()
-                            {
-                                if let Some(timestamp) = local_day(*date) {
-                                    self.record_undo();
-                                    self.project.shoot_days.push(ShootDay::new(timestamp));
-                                    self.project.shoot_days.sort_by_key(|day| day.date);
-                                }
-                            }
-                        });
+                        }
                     }
                 }
             });
@@ -1459,7 +2063,7 @@ impl CineSchedApp {
 
     /// Draws the scene list in timeline/day order with completion and move controls.
     fn draw_stripboard(&mut self, ui: &mut egui::Ui) {
-        ui.heading("Stripboard");
+        ui.heading(translate(self.language, "Stripboard"));
         let days: Vec<StripboardDay> = self
             .project
             .shoot_days
@@ -1483,126 +2087,179 @@ impl CineSchedApp {
             })
             .collect();
         for day in days {
-            ui.group(|ui| {
-                ui.strong(day.date.format("%A, %B %d, %Y").to_string());
-                ui.label(format!(
-                    "{} pages / {} min",
-                    eighths_label(day.pages),
-                    day.minutes
-                ));
-                for (scene_id, title, mut completed) in day.scenes {
-                    ui.horizontal(|ui| {
-                        if ui.checkbox(&mut completed, "").changed() {
-                            self.record_undo();
-                            if let Some(scene) = self.project.scene_mut(scene_id) {
-                                scene.is_completed = completed;
-                            }
-                        }
-                        if ui.selectable_label(false, title).clicked() {
-                            self.selected_scene = Some(scene_id);
-                        }
-                        let destination_days: Vec<(Uuid, String)> = self
-                            .project
-                            .shoot_days
-                            .iter()
-                            .filter(|shoot_day| shoot_day.id != day.day_id)
-                            .map(|shoot_day| {
-                                (shoot_day.id, shoot_day.date.format("%b %d").to_string())
-                            })
-                            .collect();
-                        if let Some((first_destination, _)) = destination_days.first() {
-                            let mut destination_id = self
-                                .schedule_targets
-                                .get(&scene_id)
-                                .copied()
-                                .filter(|target| {
-                                    destination_days.iter().any(|(day_id, _)| day_id == target)
-                                })
-                                .unwrap_or(*first_destination);
-                            egui::ComboBox::from_id_salt(("move-scene-day", scene_id))
-                                .selected_text(
-                                    destination_days
-                                        .iter()
-                                        .find(|(day_id, _)| *day_id == destination_id)
-                                        .map(|(_, label)| label.as_str())
-                                        .unwrap_or("Choose day"),
+            let (_, dropped_scene_ids) =
+                ui.dnd_drop_zone::<Vec<Uuid>, _>(egui::Frame::group(ui.style()), |ui| {
+                    ui.strong(format_long_date(day.date, self.language));
+                    ui.label(format!(
+                        "{} pages / {} min",
+                        eighths_label(day.pages),
+                        day.minutes
+                    ));
+                    for (scene_position, (scene_id, title, mut completed)) in
+                        day.scenes.into_iter().enumerate()
+                    {
+                        let (_, scene_drop_payload) =
+                            ui.dnd_drop_zone::<Vec<Uuid>, _>(egui::Frame::NONE, |ui| {
+                                ui.dnd_drag_source(
+                                    egui::Id::new(("scheduled-scene", scene_id)),
+                                    vec![scene_id],
+                                    |ui| {
+                                        ui.horizontal(|ui| {
+                                            if ui.checkbox(&mut completed, "").changed() {
+                                                self.record_undo();
+                                                if let Some(scene) =
+                                                    self.project.scene_mut(scene_id)
+                                                {
+                                                    scene.is_completed = completed;
+                                                }
+                                            }
+                                            if ui.selectable_label(false, title).clicked() {
+                                                self.selected_scene = Some(scene_id);
+                                            }
+                                            let destination_days: Vec<(Uuid, String)> = self
+                                                .project
+                                                .shoot_days
+                                                .iter()
+                                                .filter(|shoot_day| shoot_day.id != day.day_id)
+                                                .map(|shoot_day| {
+                                                    (
+                                                        shoot_day.id,
+                                                        shoot_day.date.format("%b %d").to_string(),
+                                                    )
+                                                })
+                                                .collect();
+                                            if let Some((first_destination, _)) =
+                                                destination_days.first()
+                                            {
+                                                let mut destination_id = self
+                                                    .schedule_targets
+                                                    .get(&scene_id)
+                                                    .copied()
+                                                    .filter(|target| {
+                                                        destination_days
+                                                            .iter()
+                                                            .any(|(day_id, _)| day_id == target)
+                                                    })
+                                                    .unwrap_or(*first_destination);
+                                                egui::ComboBox::from_id_salt((
+                                                    "move-scene-day",
+                                                    scene_id,
+                                                ))
+                                                .selected_text(
+                                                    destination_days
+                                                        .iter()
+                                                        .find(|(day_id, _)| {
+                                                            *day_id == destination_id
+                                                        })
+                                                        .map(|(_, label)| label.as_str())
+                                                        .unwrap_or("Choose day"),
+                                                )
+                                                .show_ui(ui, |ui| {
+                                                    for (target_id, label) in &destination_days {
+                                                        ui.selectable_value(
+                                                            &mut destination_id,
+                                                            *target_id,
+                                                            label,
+                                                        );
+                                                    }
+                                                });
+                                                self.schedule_targets
+                                                    .insert(scene_id, destination_id);
+                                                if ui.small_button("Move day").clicked() {
+                                                    self.record_undo();
+                                                    if !self
+                                                        .project
+                                                        .move_scene(scene_id, destination_id)
+                                                    {
+                                                        self.set_status(
+                                                            "Could not move scene to the selected day",
+                                                        );
+                                                    }
+                                                }
+                                            }
+                                            if ui.small_button("Up").clicked() {
+                                                let position = self
+                                                    .project
+                                                    .shoot_days
+                                                    .iter()
+                                                    .find(|shoot_day| shoot_day.id == day.day_id)
+                                                    .and_then(|shoot_day| {
+                                                        shoot_day
+                                                            .scenes
+                                                            .iter()
+                                                            .position(|scene| scene.id == scene_id)
+                                                    });
+                                                if let Some(index) =
+                                                    position.filter(|index| *index > 0)
+                                                {
+                                                    self.record_undo();
+                                                    if let Some(day) =
+                                                        self.project.shoot_days.iter_mut().find(
+                                                            |shoot_day| shoot_day.id == day.day_id,
+                                                        )
+                                                    {
+                                                        day.scenes.swap(index, index - 1);
+                                                    }
+                                                }
+                                            }
+                                            if ui.small_button("Down").clicked() {
+                                                let position = self
+                                                    .project
+                                                    .shoot_days
+                                                    .iter()
+                                                    .find(|shoot_day| shoot_day.id == day.day_id)
+                                                    .and_then(|shoot_day| {
+                                                        shoot_day
+                                                            .scenes
+                                                            .iter()
+                                                            .position(|scene| scene.id == scene_id)
+                                                    });
+                                                let can_move_down = position.is_some_and(|index| {
+                                                    self.project
+                                                        .shoot_days
+                                                        .iter()
+                                                        .find(|shoot_day| {
+                                                            shoot_day.id == day.day_id
+                                                        })
+                                                        .is_some_and(|shoot_day| {
+                                                            index + 1 < shoot_day.scenes.len()
+                                                        })
+                                                });
+                                                if let Some(index) =
+                                                    position.filter(|_| can_move_down)
+                                                {
+                                                    self.record_undo();
+                                                    if let Some(day) =
+                                                        self.project.shoot_days.iter_mut().find(
+                                                            |shoot_day| shoot_day.id == day.day_id,
+                                                        )
+                                                    {
+                                                        day.scenes.swap(index, index + 1);
+                                                    }
+                                                }
+                                            }
+                                            if ui.small_button("Unassign").clicked() {
+                                                self.record_undo();
+                                                self.project.unschedule_scene(scene_id);
+                                            }
+                                        })
+                                    },
                                 )
-                                .show_ui(ui, |ui| {
-                                    for (target_id, label) in &destination_days {
-                                        ui.selectable_value(&mut destination_id, *target_id, label);
-                                    }
-                                });
-                            self.schedule_targets.insert(scene_id, destination_id);
-                            if ui.small_button("Move day").clicked() {
-                                self.record_undo();
-                                if !self.project.move_scene(scene_id, destination_id) {
-                                    self.status =
-                                        "Could not move scene to the selected day".to_owned();
-                                }
-                            }
-                        }
-                        if ui.small_button("Up").clicked() {
-                            let position = self
-                                .project
-                                .shoot_days
-                                .iter()
-                                .find(|shoot_day| shoot_day.id == day.day_id)
-                                .and_then(|shoot_day| {
-                                    shoot_day
-                                        .scenes
-                                        .iter()
-                                        .position(|scene| scene.id == scene_id)
-                                });
-                            if let Some(index) = position.filter(|index| *index > 0) {
-                                self.record_undo();
-                                if let Some(day) = self
-                                    .project
-                                    .shoot_days
-                                    .iter_mut()
-                                    .find(|shoot_day| shoot_day.id == day.day_id)
-                                {
-                                    day.scenes.swap(index, index - 1);
-                                }
-                            }
-                        }
-                        if ui.small_button("Down").clicked() {
-                            let position = self
-                                .project
-                                .shoot_days
-                                .iter()
-                                .find(|shoot_day| shoot_day.id == day.day_id)
-                                .and_then(|shoot_day| {
-                                    shoot_day
-                                        .scenes
-                                        .iter()
-                                        .position(|scene| scene.id == scene_id)
-                                });
-                            let can_move_down = position.is_some_and(|index| {
-                                self.project
-                                    .shoot_days
-                                    .iter()
-                                    .find(|shoot_day| shoot_day.id == day.day_id)
-                                    .is_some_and(|shoot_day| index + 1 < shoot_day.scenes.len())
                             });
-                            if let Some(index) = position.filter(|_| can_move_down) {
-                                self.record_undo();
-                                if let Some(day) = self
-                                    .project
-                                    .shoot_days
-                                    .iter_mut()
-                                    .find(|shoot_day| shoot_day.id == day.day_id)
-                                {
-                                    day.scenes.swap(index, index + 1);
-                                }
-                            }
+                        if let Some(scene_ids) = scene_drop_payload {
+                            self.accept_scene_drop(&scene_ids, day.day_id, scene_position);
                         }
-                        if ui.small_button("Unassign").clicked() {
-                            self.record_undo();
-                            self.project.unschedule_scene(scene_id);
-                        }
-                    });
-                }
-            });
+                    }
+                });
+            if let Some(scene_ids) = dropped_scene_ids {
+                let position = self
+                    .project
+                    .shoot_days
+                    .iter()
+                    .find(|shoot_day| shoot_day.id == day.day_id)
+                    .map_or(0, |shoot_day| shoot_day.scenes.len());
+                self.accept_scene_drop(&scene_ids, day.day_id, position);
+            }
         }
     }
 }
@@ -1778,6 +2435,13 @@ fn populate_call_sheet_locations(day: &mut ShootDay, location_roster: &[Location
     true
 }
 
+/// Records a project path at the front of the bounded recent-project list.
+fn record_recent_project(recent_projects: &mut Vec<std::path::PathBuf>, path: std::path::PathBuf) {
+    recent_projects.retain(|recent| recent != &path);
+    recent_projects.insert(0, path);
+    recent_projects.truncate(10);
+}
+
 /// Converts a local calendar date into the UTC timestamp used for persistence.
 fn local_day(date: NaiveDate) -> Option<chrono::DateTime<Utc>> {
     Local
@@ -1899,8 +2563,8 @@ mod tests {
 
     use super::{
         eighths_label, heading_int_ext, next_month, populate_call_sheet_locations,
-        populate_cast_calls, populate_crew_calls, previous_month, scene_order_key, CineSchedApp,
-        Project, Uuid,
+        populate_cast_calls, populate_crew_calls, previous_month, record_recent_project,
+        scene_order_key, CineSchedApp, Language, Project, Uuid,
     };
     use chrono::NaiveDate;
 
@@ -1929,10 +2593,13 @@ mod tests {
     /// Confirms project and view preferences survive eframe JSON persistence.
     #[test]
     fn app_state_persists_preferences_and_project() {
+        let recent_path = std::path::PathBuf::from("C:\\Projects\\CineSched.json");
         let app = CineSchedApp {
             dark_mode: true,
             show_cast: true,
             show_estimated_time: true,
+            language: Language::Spanish,
+            recent_projects: vec![recent_path.clone()],
             project: Project {
                 project_title: "Persistent Project".to_owned(),
                 ..Project::default()
@@ -1947,8 +2614,41 @@ mod tests {
         assert!(restored.dark_mode);
         assert!(restored.show_cast);
         assert!(restored.show_estimated_time);
+        assert_eq!(restored.language, Language::Spanish);
         assert_eq!(restored.project.project_title, "Persistent Project");
+        assert_eq!(restored.recent_projects, [recent_path]);
         assert!(restored.undo_stack.is_empty());
+
+        let mut previous_version: serde_json::Value =
+            serde_json::from_str(&encoded).expect("app JSON parses");
+        previous_version
+            .as_object_mut()
+            .expect("app state is an object")
+            .remove("recent_projects");
+        let restored_previous: CineSchedApp = serde_json::from_value(previous_version)
+            .expect("app state without recent projects remains compatible");
+        assert!(restored_previous.recent_projects.is_empty());
+    }
+
+    /// Confirms recent paths are de-duplicated, promoted, and capped at ten entries.
+    #[test]
+    fn recent_projects_promote_duplicates_and_keep_ten_paths() {
+        let mut recent = Vec::new();
+        for index in 0..10 {
+            record_recent_project(
+                &mut recent,
+                std::path::PathBuf::from(format!("project-{index}.json")),
+            );
+        }
+        let oldest = recent[9].clone();
+
+        record_recent_project(&mut recent, oldest.clone());
+        record_recent_project(&mut recent, std::path::PathBuf::from("new-project.json"));
+
+        assert_eq!(recent.len(), 10);
+        assert_eq!(recent[0], std::path::PathBuf::from("new-project.json"));
+        assert_eq!(recent[1], oldest);
+        assert_eq!(recent.iter().filter(|path| **path == oldest).count(), 1);
     }
 
     /// Confirms common heading and script-order groupings remain stable.

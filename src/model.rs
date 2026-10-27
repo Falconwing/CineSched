@@ -3,7 +3,7 @@
 //! The `extra` maps retain fields that are not yet represented in the Rust
 //! interface, protecting call-sheet and breakdown data during migration.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -679,6 +679,54 @@ impl Project {
         true
     }
 
+    /// Moves a group of scenes into one shoot day at the requested insertion position.
+    ///
+    /// Matching scenes are extracted in their existing project order, preserving
+    /// their order during cross-day moves. A missing destination moves nothing.
+    pub fn move_scenes_to_day(
+        &mut self,
+        scene_ids: &[Uuid],
+        day_id: Uuid,
+        insertion_index: usize,
+    ) -> usize {
+        let Some(destination_index) = self.day_index(day_id) else {
+            return 0;
+        };
+        let mut remaining_ids: HashSet<Uuid> = scene_ids.iter().copied().collect();
+        if remaining_ids.is_empty() {
+            return 0;
+        }
+
+        let mut moving = Vec::new();
+        let boneyard = std::mem::take(&mut self.all_scenes);
+        for scene in boneyard {
+            if remaining_ids.remove(&scene.id) {
+                moving.push(scene);
+            } else {
+                self.all_scenes.push(scene);
+            }
+        }
+        for day in &mut self.shoot_days {
+            let scheduled = std::mem::take(&mut day.scenes);
+            for scene in scheduled {
+                if remaining_ids.remove(&scene.id) {
+                    moving.push(scene);
+                } else {
+                    day.scenes.push(scene);
+                }
+            }
+        }
+        if moving.is_empty() {
+            return 0;
+        }
+
+        let count = moving.len();
+        let destination = &mut self.shoot_days[destination_index].scenes;
+        let insertion_index = insertion_index.min(destination.len());
+        destination.splice(insertion_index..insertion_index, moving);
+        count
+    }
+
     /// Moves a scheduled scene back into the unscheduled Boneyard.
     ///
     /// Returns `false` when the scene is not assigned to a shoot day.
@@ -1225,6 +1273,73 @@ mod tests {
         assert!(project.move_scene(moving_id, second_day_id));
         assert_eq!(project.shoot_days[1].scenes[0].id, moving_id);
         assert_eq!(project.shoot_days[0].scenes[0].id, displaced_id);
+    }
+
+    /// Confirms grouped drag movement handles Boneyard insertion, day reordering, and bad targets.
+    #[test]
+    fn moves_scene_groups_between_boneyard_and_schedule_in_order() {
+        use chrono::{Duration, Utc};
+
+        let first = Scene::new("FIRST");
+        let second = Scene::new("SECOND");
+        let third = Scene::new("THIRD");
+        let first_id = first.id;
+        let second_id = second.id;
+        let third_id = third.id;
+        let mut day = ShootDay::new(Utc::now());
+        let day_id = day.id;
+        let existing = Scene::new("EXISTING");
+        let existing_id = existing.id;
+        day.scenes.push(existing.clone());
+        let other_day = ShootDay::new(day.date + Duration::days(1));
+        let other_day_id = other_day.id;
+        let mut project = Project {
+            all_scenes: vec![first, second, third],
+            shoot_days: vec![day, other_day],
+            ..Project::default()
+        };
+
+        assert_eq!(
+            project.move_scenes_to_day(&[third_id, first_id], day_id, 0),
+            2
+        );
+        assert_eq!(
+            project.shoot_days[0]
+                .scenes
+                .iter()
+                .map(|scene| scene.id)
+                .collect::<Vec<_>>(),
+            vec![first_id, third_id, existing_id]
+        );
+        assert_eq!(project.all_scenes.len(), 1);
+        assert_eq!(project.all_scenes[0].id, second_id);
+
+        assert_eq!(
+            project.move_scenes_to_day(&[existing_id, first_id], other_day_id, 0),
+            2
+        );
+        assert_eq!(
+            project.shoot_days[1]
+                .scenes
+                .iter()
+                .map(|scene| scene.id)
+                .collect::<Vec<_>>(),
+            vec![first_id, existing_id]
+        );
+        assert_eq!(
+            project.shoot_days[0]
+                .scenes
+                .iter()
+                .map(|scene| scene.id)
+                .collect::<Vec<_>>(),
+            vec![third_id]
+        );
+
+        assert_eq!(
+            project.move_scenes_to_day(&[second_id], Uuid::new_v4(), 0),
+            0
+        );
+        assert_eq!(project.all_scenes[0].id, second_id);
     }
 
     /// Confirms whole-day swaps move scenes and call sheets but preserve date-specific state.
