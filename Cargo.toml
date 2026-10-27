@@ -1,0 +1,21 @@
+[package]
+name = "cinesched"
+version = "0.1.0"
+edition = "2021"
+description = "Cross-platform film production scheduling application"
+license = "GPL-3.0-only"
+
+[dependencies]
+chrono = { version = "0.4", features = ["serde"] }
+eframe = { version = "0.31", default-features = false, features = ["default_fonts", "glow", "persistence"] }
+quick-xml = "0.37"
+rfd = "0.15"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+uuid = { version = "1", features = ["serde", "v4"] }
+zip = { version = "2", default-features = false, features = ["deflate"] }
+
+[[bin]]
+name = "cinesched"
+path = "src/main.rs"

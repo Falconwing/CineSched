@@ -1,10 +1,48 @@
-# CineSched — Film Production Scheduling & One-Line Schedule App
+# CineSched - Film Production Scheduling & One-Line Schedule App
 
-A macOS application for scheduling film shoots — visual calendar and stripboard scheduling, scene breakdown tagging, actor availability and conflict tracking, call sheets, vector PDF exports, and Final Draft script import.
+## Rust Desktop Port
 
-![Platform](https://img.shields.io/badge/platform-macOS-blue)
-![Swift](https://img.shields.io/badge/Swift-5.0-orange)
-![SwiftUI](https://img.shields.io/badge/SwiftUI-4.0-green)
+A native Rust desktop application is being developed with egui to support
+Windows and macOS. The current Rust application includes a monthly calendar,
+scene and breakdown editing, a stripboard, cast and crew setup, call sheets,
+schedule conflict and lock reports, script import, project persistence,
+appearance preferences, undo/redo for primary schedule actions, and PDF
+exports. The SwiftUI implementation remains in the repository as the feature
+reference until platform behavior and export parity have been reviewed.
+
+### Build and test the Rust application
+
+Install the stable Rust toolchain, then run:
+
+```powershell
+cargo run
+cargo fmt --all -- --check
+cargo build --all-targets
+cargo test --all-targets
+cargo clippy --all-targets --all-features -- -D warnings
+```
+
+The GitHub Actions workflow builds and runs tests on Windows and macOS. Project
+JSON fields that are not yet represented in the Rust interface are preserved
+when opening and saving a project.
+
+The port is not yet a complete replacement for the mature macOS application.
+Remaining parity work includes drag-and-drop scene rescheduling, full calendar
+event/notice and automatic meal workflows,
+call-sheet automatic weather lookup and deeper production-roster integration,
+high-fidelity vector PDF layouts and pagination, import-review and parser edge cases,
+localized English/Spanish UI, per-scene color customization, recent-project
+management, autosave, and complete undo/redo coverage. Verify differences
+against the Swift reference before removing any Swift source.
+
+A cross-platform desktop scheduler for film shoots. The existing SwiftUI
+application provides visual calendar and stripboard scheduling, scene
+breakdown tagging, actor availability and conflict tracking, call sheets,
+vector PDF exports, and Final Draft script import.
+
+![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20macOS-blue)
+![Rust](https://img.shields.io/badge/Rust-stable-orange)
+![egui](https://img.shields.io/badge/UI-egui-green)
 ![License](https://img.shields.io/badge/license-GPL--v3-lightgrey)
 
 > **Free for the film community.** Built by a filmmaker, for filmmakers. If you find it useful, the best way to say thanks is to share it.
@@ -13,15 +51,15 @@ A macOS application for scheduling film shoots — visual calendar and stripboar
 
 This app has three layers of history worth knowing about:
 
-- **The original CineSched**, created by Chris Tempel — a calendar-based scheduler built to solve his own need for a real film scheduling tool without the cost or complexity of commercial software.
-- **The Stripboard, the monthly calendar with its day-inspector popup, bilingual English/Español support, the dynamic timeline cascade, vector PDF exports (including the "Plan de Rodaje" one-line schedule), calendar events, and notice banners** — all built by **alucardGonza**, who forked the original project and substantially reworked its interface and feature set. The Stripboard view and the overall visual redesign in particular are entirely their work, not a continuation of the original app's design.
+- **The original CineSched**, created by Chris Tempel - a calendar-based scheduler built to solve his own need for a real film scheduling tool without the cost or complexity of commercial software.
+- **The Stripboard, the monthly calendar with its day-inspector popup, bilingual English/Español support, the dynamic timeline cascade, vector PDF exports (including the "Plan de Rodaje" one-line schedule), calendar events, and notice banners** - all built by **alucardGonza**, who forked the original project and substantially reworked its interface and feature set. The Stripboard view and the overall visual redesign in particular are entirely their work, not a continuation of the original app's design.
 - **This version** takes alucardGonza's fork as its base and layers on a round of bug fixes and personal customizations:
   - A real Sunday-first calendar week (the original fork's week and its exported PDF were both hardcoded Monday-first)
   - A toggleable cast row and a toggleable estimated-time display on calendar strips
   - User-customizable scene colors
   - Persisted view-mode and sidebar preferences
-  - **Multi-language support removed** — the app is English-only now; see the note below if you're comparing against alucardGonza's original bilingual version
-  - A serious Final Draft import bug fixed — scripts with a DualDialogue block (two characters' dialogue printed side by side) were silently losing every scene after that point; see [Script Import](#-script-import) below
+  - **Multi-language support removed** - the app is English-only now; see the note below if you're comparing against alucardGonza's original bilingual version
+  - A serious Final Draft import bug fixed - scripts with a DualDialogue block (two characters' dialogue printed side by side) were silently losing every scene after that point; see [Script Import](#-script-import) below
   - Fixes to several drag-and-drop reliability issues (multi-select drags from the Boneyard, gesture-priority conflicts with starting a drag, and stuck day-highlighting after both undo/redo and ordinary drops)
 
 If you're comparing notes with either of their versions: the project-file format is compatible in both directions for the fields both versions share, so a file made in one should open fine in another.
@@ -30,26 +68,26 @@ If you're comparing notes with either of their versions: the project-file format
 
 ### 🗓️ Two ways to view your schedule
 
-- **Full Month** — a traditional monthly calendar grid, Sunday-first, with a day-inspector popup (double-click any day) showing scene counts, page totals, estimated time, call sheet milestones (General Call, Lunch, Snack, Wrap, Basecamp), and quick actions to edit or export that day's call sheet.
-- **Full Schedule** — a single continuous vertical scroll through every day in your production's date range, including unscheduled days, with no month-by-month pagination to click through. (Originally called "Shoot Days Only" in alucardGonza's fork, which filtered out a few kinds of days — this version renamed it and removed that filtering so it's a genuinely complete scroll.)
+- **Full Month** - a traditional monthly calendar grid, Sunday-first, with a day-inspector popup (double-click any day) showing scene counts, page totals, estimated time, call sheet milestones (General Call, Lunch, Snack, Wrap, Basecamp), and quick actions to edit or export that day's call sheet.
+- **Full Schedule** - a single continuous vertical scroll through every day in your production's date range, including unscheduled days, with no month-by-month pagination to click through. (Originally called "Shoot Days Only" in alucardGonza's fork, which filtered out a few kinds of days - this version renamed it and removed that filtering so it's a genuinely complete scroll.)
 - Your last-used view (Full Month vs. Full Schedule, and whether the sidebar is open or collapsed) is remembered the next time you open the app.
-- A separate **Stripboard** view is also available from the toolbar — the traditional paper-strips-on-a-corkboard layout ADs have used for decades, now digital, with a dynamic timeline cascade calculating start/end times for every scene and banner from call time to wrap.
+- A separate **Stripboard** view is also available from the toolbar - the traditional paper-strips-on-a-corkboard layout ADs have used for decades, now digital, with a dynamic timeline cascade calculating start/end times for every scene and banner from call time to wrap.
 
 ### 📅 Visual Calendar Scheduling
 
 - Drag-and-drop scene strips onto calendar days, individually or as a multi-selected group from the Boneyard
-- Color-coded by INT/EXT and time of day (Day, Night, Dawn, Dusk, Afternoon), fully **user-customizable** (see below) — red is reserved for flagged strips
-- **Send to Day…** — jump a scene (or selection) to any day via a graphical picker
-- Drag entire days (scenes + call sheet) to reschedule — swaps content if the target day is occupied
+- Color-coded by INT/EXT and time of day (Day, Night, Dawn, Dusk, Afternoon), fully **user-customizable** (see below) - red is reserved for flagged strips
+- **Send to Day…** - jump a scene (or selection) to any day via a graphical picker
+- Select two existing calendar days and use **Swap with selected day** to exchange their scenes and call sheets; blackout state stays with each calendar date
 - Fast custom hover tooltips show a scene's cast and summary
 - Search the whole schedule (title, cast, or summary) and jump straight to a match, scheduled or not
-- **View menu → Show Cast in Calendar** — adds a second row to every strip showing its cast, independent of whether the sidebar is open
-- **View menu → Show Estimated Time Instead of Page Count** — swaps the eighths-of-a-page count on each strip for its estimated shoot time instead
+- **View menu → Show Cast in Calendar** - adds a second row to every strip showing its cast, independent of whether the sidebar is open
+- **View menu → Show Estimated Time Instead of Page Count** - swaps the eighths-of-a-page count on each strip for its estimated shoot time instead
 
 ### 🎨 Customizable Scene Colors
 
 - View menu → Customize Scene Colors… lets you override any of the ten INT/EXT × time-of-day color combinations, plus Custom
-- Changes apply everywhere a scene's color appears — the calendar, the Stripboard, and both PDF exporters all draw from the same source
+- Changes apply everywhere a scene's color appears - the calendar, the Stripboard, and both PDF exporters all draw from the same source
 - Reset All to Defaults restores the original industry-standard palette at any time
 
 ### 🚩 Notice Banners, Calendar Events & Auto-Meals
@@ -62,14 +100,14 @@ If you're comparing notes with either of their versions: the project-file format
 - Day, Night, Dawn, Dusk, Afternoon, or Custom type per scene
 - "Boneyard" sidebar for unscheduled scenes, sortable, with multi-select drag onto any day
 - Tag Extras, Props, Set Dressing, Wardrobe, Makeup/Hair, Vehicles, Special Equipment, Stunts, SFX, and VFX per scene
-- **Breakdown Browser** — step through every scene in script order (regardless of scheduling status) to tag as you go
-- **Export Scene Breakdowns** — one classic AD-style breakdown sheet per scene, script order
+- **Breakdown Browser** - step through every scene in script order (regardless of scheduling status) to tag as you go
+- **Export Scene Breakdowns** - one classic AD-style breakdown sheet per scene, script order
 
 ### 👥 Actor Availability, Conflicts & Schedule Lock
 
 - Mark actor unavailable-date ranges in Production Setup; conflicts are scanned automatically and flagged red on the calendar
 - **Scan for Conflicts** report jumps you straight to each one
-- **Blackout days** — right-click a date to mark it (or every matching weekday) unavailable; scenes can still go there as working space, just flagged
+- **Blackout days** - right-click a date to mark it (or every matching weekday) unavailable; scenes can still go there as working space, just flagged
 - **Lock Schedule** snapshots each actor's working days; any later change gets flagged via a badge and a full Schedule Lock Report, without restricting further edits
 
 ### 📊 Days Out of Days (DOOD) & Vector Schedule Exports
@@ -83,11 +121,13 @@ If you're comparing notes with either of their versions: the project-file format
 - Final Draft (`.fdx`), Fountain, and Highland archive formats all supported
 - Automatic scene number, location, and day/night extraction
 - Import summary screen shows what was found before committing to the Boneyard
-- **If you imported a long script before and ended up with noticeably fewer scenes than expected** (importing stopped partway through, silently), that was a real bug in how the parser tracked nested XML elements — Final Draft represents DualDialogue blocks as nested paragraphs, and the parser's depth-tracking was structurally incapable of ever recognizing that nesting, which desynced its internal state the first time it hit one and caused every scene after that point to be silently dropped. This is fixed. One known remaining gap: cast members who *only* appear inside a DualDialogue exchange aren't picked up by the automatic cast detection for that scene — add them manually if that comes up.
+- **If you imported a long script before and ended up with noticeably fewer scenes than expected** (importing stopped partway through, silently), that was a real bug in how the parser tracked nested XML elements - Final Draft represents DualDialogue blocks as nested paragraphs, and the parser's depth-tracking was structurally incapable of ever recognizing that nesting, which desynced its internal state the first time it hit one and caused every scene after that point to be silently dropped. This is fixed. One known remaining gap: cast members who *only* appear inside a DualDialogue exchange aren't picked up by the automatic cast detection for that scene - add them manually if that comes up.
 
 ### 📋 Call Sheets & Production Setup
 
-- Per-day call sheets with cast (auto-pulled, editable), crew (roster-based checkboxes), locations (roster or freeform), and notes
+- Per-day call sheets with editable milestones, workday schedule, contacts, weather and sun details, notes, locations, and cast/crew call rows
+- Populate cast calls from scheduled scenes and the production cast roster; load crew and locations from their production rosters
+- Exported call sheets include schedule milestones, weather, sun times, locations, cast timing details, crew contacts, and production notes
 - Renaming an actor or crew member in Production Setup ripples through every call sheet automatically
 - Reusable location roster with autocomplete
 
@@ -99,7 +139,7 @@ If you're comparing notes with either of their versions: the project-file format
 
 ## A note on language
 
-alucardGonza's original fork included full bilingual English/Español support, reactive across every menu, sheet, and export. **This version has that disabled — the app is English-only.** The underlying system is still in the code (so re-enabling it later is a small change, not a rewrite), but the language-switcher menu has been removed, and a few strings that were hardcoded in Spanish regardless of any language setting — including two default PDF export filenames — have been changed to English directly.
+alucardGonza's original fork included full bilingual English/Español support, reactive across every menu, sheet, and export. **This version has that disabled - the app is English-only.** The underlying system is still in the code (so re-enabling it later is a small change, not a rewrite), but the language-switcher menu has been removed, and a few strings that were hardcoded in Spanish regardless of any language setting - including two default PDF export filenames - have been changed to English directly.
 
 ## Installation
 
@@ -113,9 +153,9 @@ alucardGonza's original fork included full bilingual English/Español support, r
 This repository is distributed as loose source files rather than an `.xcodeproj`. To build it:
 
 1. Create a new macOS App project in Xcode (SwiftUI).
-2. **Delete Xcode's own auto-generated app-entry and content-view files.** This project brings its own `CineSchedApp.swift` and `ContentView.swift`, and having two `@main` types in one target will fail to build. Double-check afterward, too — if you ever see "1 Alternate" when using Xcode's Open Quickly (⌘⇧O) to search for `CineSchedApp`, that's very likely just Xcode showing the struct itself as a separate symbol match, not a real duplicate file; don't assume it's a problem without actually checking each result's file location first.
+2. **Delete Xcode's own auto-generated app-entry and content-view files.** This project brings its own `CineSchedApp.swift` and `ContentView.swift`, and having two `@main` types in one target will fail to build. Double-check afterward, too - if you ever see "1 Alternate" when using Xcode's Open Quickly (⌘⇧O) to search for `CineSchedApp`, that's very likely just Xcode showing the struct itself as a separate symbol match, not a real duplicate file; don't assume it's a problem without actually checking each result's file location first.
 3. Add every `.swift` file from this repository to the target, along with `Info.plist` and `CineSched.entitlements`.
-4. In **Signing & Capabilities**, under **App Sandbox → File Access**, set **User Selected File** to **Read/Write** — this is required for Save As, Open, and script import to work; Xcode's default new-project entitlements don't include it.
+4. In **Signing & Capabilities**, under **App Sandbox → File Access**, set **User Selected File** to **Read/Write** - this is required for Save As, Open, and script import to work; Xcode's default new-project entitlements don't include it.
 5. Build once before making any changes, to confirm a clean baseline.
 
 ### First Launch (Unsigned App)
@@ -128,7 +168,7 @@ Since this isn't distributed through the Mac App Store or signed with a Develope
 
 ### If a change you made doesn't seem to take effect
 
-Before assuming the code is wrong: confirm you're editing and replacing the file in the **correct** Xcode project, especially if you have more than one CineSched-family project on your machine (an easy mix-up, and one that cost real time during this app's own development). A reliable way to tell this project apart from an older/different one: search for `StripboardView` in the Project Navigator — that file only exists in this version.
+Before assuming the code is wrong: confirm you're editing and replacing the file in the **correct** Xcode project, especially if you have more than one CineSched-family project on your machine (an easy mix-up, and one that cost real time during this app's own development). A reliable way to tell this project apart from an older/different one: search for `StripboardView` in the Project Navigator - that file only exists in this version.
 
 ## Updating the App Icon
 
@@ -136,9 +176,9 @@ The app icon is generated from a single 1024×1024 PNG. To update it:
 
 1. Replace the source PNG with your new artwork (must be exactly 1024×1024, RGBA).
 2. Generate the full macOS icon set from it (16/32/128/256/512, each at 1x and 2x) and package it as an `AppIcon.appiconset` folder with a `Contents.json` manifest.
-3. In Xcode, open `Assets.xcassets`, select (or create) the `AppIcon` entry, and drag the new `.appiconset` folder in to replace it — or drag the individual sized PNGs into their matching slots if the asset catalog already exists.
+3. In Xcode, open `Assets.xcassets`, select (or create) the `AppIcon` entry, and drag the new `.appiconset` folder in to replace it - or drag the individual sized PNGs into their matching slots if the asset catalog already exists.
 4. Clean Build Folder (⇧⌘K) and rebuild so Xcode doesn't reuse a cached icon.
-5. If the built app still shows a generic icon after a clean rebuild, that's very likely macOS's own system-level icon cache, not your project — quit the app, delete any old built copy, and clear the cache:
+5. If the built app still shows a generic icon after a clean rebuild, that's very likely macOS's own system-level icon cache, not your project - quit the app, delete any old built copy, and clear the cache:
    ```
    sudo rm -rf /Library/Caches/com.apple.iconservices.store
    sudo find /private/var/folders/ -name com.apple.dock.iconcache -delete
@@ -166,18 +206,18 @@ All scenes, calendar days, call sheets, production info, and any active schedule
 
 ## Contributing
 
-Contributions are welcome — bug fixes, new features, documentation, or a Windows/cross-platform port (the `.json` format is simple enough to support a compatible non-macOS client). See `CONTRIBUTING.md`.
+Contributions are welcome - bug fixes, new features, documentation, or a Windows/cross-platform port (the `.json` format is simple enough to support a compatible non-macOS client). See `CONTRIBUTING.md`.
 
 ## Credits
 
-- **Chris Tempel** — created the original CineSched.
-- **alucardGonza** — forked the project and built the Stripboard view, the monthly calendar's day-inspector, bilingual English/Español support, the dynamic timeline cascade, vector PDF exports, calendar events, and notice banners. The look and feel of this version owes its foundation to that work.
+- **Chris Tempel** - created the original CineSched.
+- **alucardGonza** - forked the project and built the Stripboard view, the monthly calendar's day-inspector, bilingual English/Español support, the dynamic timeline cascade, vector PDF exports, calendar events, and notice banners. The look and feel of this version owes its foundation to that work.
 - **Final Draft** for the `.fdx` format.
 - **Claude (Anthropic)** for development assistance throughout all three layers of this project's history.
 
 ## License
 
-GNU General Public License v3 — free to use, modify, and distribute; modified versions must also be released as open source under the same license. See `LICENSE`.
+GNU General Public License v3 - free to use, modify, and distribute; modified versions must also be released as open source under the same license. See `LICENSE`.
 
 ## Support
 
